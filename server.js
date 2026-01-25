@@ -1,7 +1,10 @@
 /**
  * SearXNG Proxy Server
- * Version: 1.1.0
+ * Version: 1.1.1
  * Last Update: 2026-01-25
+ *
+ * Cambios v1.1.1:
+ * - /info ahora requiere token (INFO_TOKEN) para acceso
  *
  * Cambios v1.1.0:
  * - Puppeteer ahora es opcional (carga dinámica)
@@ -15,8 +18,8 @@ const cors = require('cors');
 const cheerio = require('cheerio');
 const FormData = require('form-data');
 
-const VERSION = '1.1.0';
-const BUILD_DATE = '2026-01-25T17:00:00Z';
+const VERSION = '1.1.1';
+const BUILD_DATE = '2026-01-25T17:10:00Z';
 
 // Puppeteer es opcional - cargarlo dinámicamente solo cuando se necesite
 let puppeteer = null;
@@ -53,8 +56,16 @@ app.get('/health', (req, res) => {
   res.json({ status: 'ok', timestamp: new Date().toISOString() });
 });
 
-// Info endpoint for debugging - USAR PARA VERIFICAR VERSION
+// Info endpoint for debugging - PROTEGIDO CON TOKEN
+// Usar: /info?token=TU_TOKEN o configurar INFO_TOKEN en variables de entorno
+const INFO_TOKEN = process.env.INFO_TOKEN || '';
+
 app.get('/info', async (req, res) => {
+  // Si hay token configurado, requerir autenticación
+  if (INFO_TOKEN && req.query.token !== INFO_TOKEN) {
+    return res.status(401).json({ error: 'Unauthorized', hint: 'Add ?token=YOUR_TOKEN' });
+  }
+
   const pup = await getPuppeteer();
   res.json({
     status: 'ok',
