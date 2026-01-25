@@ -3,6 +3,10 @@
  * Version: 1.2.6
  * Last Update: 2026-01-25
  *
+ * Cambios v1.2.7:
+ * - Fallback a todos los archivos de Open WebUI si la KB está vacía
+ * - Mejor manejo de archivos subidos que no se asociaron a la KB
+ *
  * Cambios v1.2.6:
  * - Nuevo endpoint /debug-rag para diagnosticar contenido de Knowledge Base
  * - Mejorado /retrieve-only con múltiples estrategias de retrieval
@@ -48,8 +52,8 @@ const cors = require('cors');
 const cheerio = require('cheerio');
 const FormData = require('form-data');
 
-const VERSION = '1.2.6';
-const BUILD_DATE = '2026-01-26T00:30:00Z';
+const VERSION = '1.2.7';
+const BUILD_DATE = '2026-01-26T01:00:00Z';
 
 // Puppeteer es opcional - cargarlo dinámicamente solo cuando se necesite
 let puppeteer = null;
@@ -1002,23 +1006,55 @@ app.get('/debug-rag', async (req, res) => {
       }
     }
 
-    // 4. Listar todas las colecciones disponibles
+    // 4. Listar TODOS los archivos de Open WebUI (no solo los de la KB)
     try {
-      const collectionsResponse = await fetch(`${OPENWEBUI_URL}/api/v1/retrieval/collections`, {
+      const allFilesResponse = await fetch(`${OPENWEBUI_URL}/api/v1/files/`, {
         headers: { 'Authorization': `Bearer ${apiKey}` }
       });
 
-      if (collectionsResponse.ok) {
-        const collections = await collectionsResponse.json();
-        debug.checks.availableCollections = collections;
+      if (allFilesResponse.ok) {
+        const allFiles = await allFilesResponse.json();
+        debug.checks.allOpenWebUIFiles = {
+          status: 'ok',
+          totalCount: allFiles.length,
+          files: allFiles.slice(0, 10).map(f => ({
+            id: f.id,
+            filename: f.filename || f.meta?.name,
+            created_at: f.created_at,
+            size: f.meta?.size,
+            contentType: f.meta?.content_type
+          }))
+        };
+
+        // Obtener contenido del primer archivo si existe
+        if (allFiles.length > 0) {
+          const firstFile = allFiles[0];
+          try {
+            const firstFileResponse = await fetch(`${OPENWEBUI_URL}/api/v1/files/${firstFile.id}`, {
+              headers: { 'Authorization': `Bearer ${apiKey}` }
+            });
+            if (firstFileResponse.ok) {
+              const firstFileData = await firstFileResponse.json();
+              debug.checks.firstFileContent = {
+                fileId: firstFile.id,
+                filename: firstFile.filename || firstFile.meta?.name,
+                hasContent: !!(firstFileData.data?.content),
+                contentLength: firstFileData.data?.content?.length || 0,
+                contentPreview: firstFileData.data?.content?.substring(0, 500) || 'No content'
+              };
+            }
+          } catch (err) {
+            debug.checks.firstFileContent = { status: 'error', error: err.message };
+          }
+        }
       } else {
-        debug.checks.availableCollections = {
+        debug.checks.allOpenWebUIFiles = {
           status: 'error',
-          statusCode: collectionsResponse.status
+          statusCode: allFilesResponse.status
         };
       }
     } catch (err) {
-      debug.checks.availableCollections = { status: 'endpoint_not_available', error: err.message };
+      debug.checks.allOpenWebUIFiles = { status: 'error', error: err.message };
     }
 
     console.log(`[DEBUG-RAG] Diagnóstico completado`);
@@ -1117,9 +1153,9 @@ app.post('/retrieve-only', async (req, res) => {
       }
     }
 
-    // Estrategia 2: Si no hay resultados vectoriales, obtener contenido de archivos directamente
+    // Estrategia 2: Si no hay resultados vectoriales, obtener contenido de archivos de la KB
     if (!retrievalSuccess || chunks.length === 0) {
-      console.log(`[RAG] Retrieval vectorial sin resultados, obteniendo archivos directamente...`);
+      console.log(`[RAG] Retrieval vectorial sin resultados, obteniendo archivos de KB...`);
 
       try {
         const kbResponse = await fetch(`${OPENWEBUI_URL}/api/v1/knowledge/${kbId}`, {
@@ -1133,9 +1169,8 @@ app.post('/retrieve-only', async (req, res) => {
           if (kbData.files && kbData.files.length > 0) {
             for (const file of kbData.files.slice(0, 5)) {
               try {
-                // Obtener ID real del archivo (puede estar en diferentes propiedades)
                 const fileId = file.id || file.file_id;
-                console.log(`[RAG] Obteniendo archivo: ${fileId} (${file.filename || file.meta?.name || 'unknown'})`);
+                console.log(`[RAG] Obteniendo archivo de KB: ${fileId}`);
 
                 const fileResponse = await fetch(`${OPENWEBUI_URL}/api/v1/files/${fileId}`, {
                   headers: { 'Authorization': `Bearer ${apiKey}` }
@@ -1146,25 +1181,23 @@ app.post('/retrieve-only', async (req, res) => {
                   console.log(`[RAG] Archivo ${fileId}: data.content = ${fileData.data?.content ? 'SI' : 'NO'} (${fileData.data?.content?.length || 0} chars)`);
 
                   if (fileData.data && fileData.data.content) {
-                    // Dividir contenido largo en chunks de ~1500 caracteres
                     const content = fileData.data.content;
                     const chunkSize = 1500;
 
                     if (content.length <= chunkSize) {
                       chunks.push({
                         content: content,
-                        filename: fileData.filename || file.filename || file.meta?.name || 'unknown',
+                        filename: fileData.filename || file.filename || 'unknown',
                         fileId: fileId,
                         source: 'file_content',
                         chunkIndex: 0
                       });
                     } else {
-                      // Dividir en múltiples chunks
                       const maxChunks = Math.min(Math.ceil(content.length / chunkSize), topK);
                       for (let i = 0; i < maxChunks; i++) {
                         chunks.push({
                           content: content.substring(i * chunkSize, (i + 1) * chunkSize),
-                          filename: fileData.filename || file.filename || file.meta?.name || 'unknown',
+                          filename: fileData.filename || file.filename || 'unknown',
                           fileId: fileId,
                           source: 'file_content',
                           chunkIndex: i
@@ -1173,39 +1206,86 @@ app.post('/retrieve-only', async (req, res) => {
                     }
                     usedMethod = 'file_content';
                   }
-                } else {
-                  console.log(`[RAG] Error obteniendo archivo ${fileId}: ${fileResponse.status}`);
                 }
               } catch (err) {
-                console.warn(`[RAG] Error procesando archivo:`, err.message);
+                console.warn(`[RAG] Error procesando archivo de KB:`, err.message);
               }
             }
           }
-
-          // Si aún no hay chunks, buscar en data de la KB
-          if (chunks.length === 0 && kbData.data) {
-            console.log(`[RAG] Buscando en data de KB...`);
-            if (typeof kbData.data === 'string' && kbData.data.length > 0) {
-              chunks.push({
-                content: kbData.data.substring(0, 3000),
-                filename: kbData.name,
-                source: 'knowledge_base_data'
-              });
-              usedMethod = 'kb_data';
-            } else if (kbData.data.content) {
-              chunks.push({
-                content: kbData.data.content.substring(0, 3000),
-                filename: kbData.name,
-                source: 'knowledge_base_data'
-              });
-              usedMethod = 'kb_data';
-            }
-          }
-        } else {
-          console.log(`[RAG] Error obteniendo KB: ${kbResponse.status}`);
         }
       } catch (err) {
-        console.warn(`[RAG] Error en método alternativo:`, err.message);
+        console.warn(`[RAG] Error obteniendo KB:`, err.message);
+      }
+    }
+
+    // Estrategia 3: Si la KB está vacía, buscar en TODOS los archivos de Open WebUI
+    if (chunks.length === 0) {
+      console.log(`[RAG] KB vacía, buscando en todos los archivos de Open WebUI...`);
+
+      try {
+        const filesResponse = await fetch(`${OPENWEBUI_URL}/api/v1/files/`, {
+          headers: { 'Authorization': `Bearer ${apiKey}` }
+        });
+
+        if (filesResponse.ok) {
+          const allFiles = await filesResponse.json();
+          console.log(`[RAG] Total archivos en Open WebUI: ${allFiles.length}`);
+
+          // Ordenar por fecha de creación (más recientes primero) y tomar los primeros 5
+          const sortedFiles = allFiles
+            .sort((a, b) => new Date(b.created_at || 0) - new Date(a.created_at || 0))
+            .slice(0, 5);
+
+          for (const file of sortedFiles) {
+            try {
+              const fileId = file.id;
+              console.log(`[RAG] Obteniendo archivo global: ${fileId} (${file.filename || file.meta?.name || 'unknown'})`);
+
+              const fileResponse = await fetch(`${OPENWEBUI_URL}/api/v1/files/${fileId}`, {
+                headers: { 'Authorization': `Bearer ${apiKey}` }
+              });
+
+              if (fileResponse.ok) {
+                const fileData = await fileResponse.json();
+                console.log(`[RAG] Archivo ${fileId}: data.content = ${fileData.data?.content ? 'SI' : 'NO'} (${fileData.data?.content?.length || 0} chars)`);
+
+                if (fileData.data && fileData.data.content) {
+                  const content = fileData.data.content;
+                  const chunkSize = 1500;
+
+                  if (content.length <= chunkSize) {
+                    chunks.push({
+                      content: content,
+                      filename: fileData.filename || file.filename || file.meta?.name || 'unknown',
+                      fileId: fileId,
+                      source: 'all_files',
+                      chunkIndex: 0
+                    });
+                  } else {
+                    const maxChunks = Math.min(Math.ceil(content.length / chunkSize), topK);
+                    for (let i = 0; i < maxChunks; i++) {
+                      chunks.push({
+                        content: content.substring(i * chunkSize, (i + 1) * chunkSize),
+                        filename: fileData.filename || file.filename || file.meta?.name || 'unknown',
+                        fileId: fileId,
+                        source: 'all_files',
+                        chunkIndex: i
+                      });
+                    }
+                  }
+                  usedMethod = 'all_files_fallback';
+
+                  // Si ya tenemos suficientes chunks, salir
+                  if (chunks.length >= topK) break;
+                }
+              }
+            } catch (err) {
+              console.warn(`[RAG] Error procesando archivo global:`, err.message);
+            }
+          }
+        }
+      } catch (err) {
+        console.warn(`[RAG] Error obteniendo archivos globales:`, err.message);
       }
     }
 
