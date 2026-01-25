@@ -1,7 +1,12 @@
 /**
  * SearXNG Proxy Server
- * Version: 1.2.5
+ * Version: 1.2.6
  * Last Update: 2026-01-25
+ *
+ * Cambios v1.2.6:
+ * - Nuevo endpoint /debug-rag para diagnosticar contenido de Knowledge Base
+ * - Mejorado /retrieve-only con múltiples estrategias de retrieval
+ * - Soporte para diferentes formatos de collection_names en Open WebUI
  *
  * Cambios v1.2.5:
  * - Nuevo endpoint /retrieve-only para obtener fragmentos sin generación
@@ -43,8 +48,8 @@ const cors = require('cors');
 const cheerio = require('cheerio');
 const FormData = require('form-data');
 
-const VERSION = '1.2.5';
-const BUILD_DATE = '2026-01-25T23:30:00Z';
+const VERSION = '1.2.6';
+const BUILD_DATE = '2026-01-26T00:30:00Z';
 
 // Puppeteer es opcional - cargarlo dinámicamente solo cuando se necesite
 let puppeteer = null;
@@ -860,6 +865,175 @@ app.post('/query-rag', async (req, res) => {
 });
 
 /**
+ * Debug RAG: Muestra información detallada de la Knowledge Base
+ * GET /debug-rag
+ */
+app.get('/debug-rag', async (req, res) => {
+  try {
+    const apiKey = getApiKey(req.query.apiKey);
+    const kbId = req.query.knowledgeId || OPENWEBUI_KNOWLEDGE_ID;
+
+    if (!apiKey) {
+      return res.status(400).json({ error: 'API Key not configured' });
+    }
+
+    if (!kbId) {
+      return res.status(400).json({ error: 'Knowledge Base ID not configured' });
+    }
+
+    console.log(`[DEBUG-RAG] Diagnosticando KB: ${kbId}`);
+
+    const debug = {
+      knowledgeBaseId: kbId,
+      openwebuiUrl: OPENWEBUI_URL,
+      checks: {}
+    };
+
+    // 1. Obtener info de la Knowledge Base
+    try {
+      const kbResponse = await fetch(`${OPENWEBUI_URL}/api/v1/knowledge/${kbId}`, {
+        headers: { 'Authorization': `Bearer ${apiKey}` }
+      });
+
+      if (kbResponse.ok) {
+        const kbData = await kbResponse.json();
+        debug.checks.knowledgeBase = {
+          status: 'ok',
+          name: kbData.name,
+          description: kbData.description,
+          filesCount: kbData.files?.length || 0,
+          files: (kbData.files || []).map(f => ({
+            id: f.id,
+            filename: f.filename || f.meta?.name,
+            size: f.meta?.size,
+            contentType: f.meta?.content_type
+          })),
+          data: kbData.data || null
+        };
+      } else {
+        debug.checks.knowledgeBase = {
+          status: 'error',
+          statusCode: kbResponse.status,
+          error: await kbResponse.text()
+        };
+      }
+    } catch (err) {
+      debug.checks.knowledgeBase = { status: 'error', error: err.message };
+    }
+
+    // 2. Probar endpoint de retrieval con diferentes formatos
+    const testQuery = 'test';
+    const collectionFormats = [
+      kbId,                          // ID directo
+      `knowledge_${kbId}`,           // Con prefijo knowledge_
+      `kb_${kbId}`,                  // Con prefijo kb_
+    ];
+
+    debug.checks.retrievalTests = [];
+
+    for (const collectionName of collectionFormats) {
+      try {
+        const retrievalResponse = await fetch(`${OPENWEBUI_URL}/api/v1/retrieval/query`, {
+          method: 'POST',
+          headers: {
+            'Authorization': `Bearer ${apiKey}`,
+            'Content-Type': 'application/json'
+          },
+          body: JSON.stringify({
+            collection_names: [collectionName],
+            query: testQuery,
+            k: 3
+          })
+        });
+
+        const retrievalData = retrievalResponse.ok ? await retrievalResponse.json() : await retrievalResponse.text();
+
+        debug.checks.retrievalTests.push({
+          collectionName,
+          status: retrievalResponse.ok ? 'ok' : 'error',
+          statusCode: retrievalResponse.status,
+          documentsCount: retrievalResponse.ok ? (retrievalData.documents?.length || retrievalData.results?.length || 0) : 0,
+          response: retrievalResponse.ok ? retrievalData : retrievalData.substring(0, 200)
+        });
+      } catch (err) {
+        debug.checks.retrievalTests.push({
+          collectionName,
+          status: 'error',
+          error: err.message
+        });
+      }
+    }
+
+    // 3. Obtener contenido de los archivos directamente
+    if (debug.checks.knowledgeBase?.files?.length > 0) {
+      debug.checks.fileContents = [];
+
+      for (const file of debug.checks.knowledgeBase.files.slice(0, 3)) {
+        try {
+          const fileResponse = await fetch(`${OPENWEBUI_URL}/api/v1/files/${file.id}`, {
+            headers: { 'Authorization': `Bearer ${apiKey}` }
+          });
+
+          if (fileResponse.ok) {
+            const fileData = await fileResponse.json();
+            debug.checks.fileContents.push({
+              fileId: file.id,
+              filename: file.filename,
+              hasContent: !!(fileData.data?.content),
+              contentLength: fileData.data?.content?.length || 0,
+              contentPreview: fileData.data?.content?.substring(0, 300) || 'No content'
+            });
+          } else {
+            debug.checks.fileContents.push({
+              fileId: file.id,
+              filename: file.filename,
+              status: 'error',
+              statusCode: fileResponse.status
+            });
+          }
+        } catch (err) {
+          debug.checks.fileContents.push({
+            fileId: file.id,
+            filename: file.filename,
+            status: 'error',
+            error: err.message
+          });
+        }
+      }
+    }
+
+    // 4. Listar todas las colecciones disponibles
+    try {
+      const collectionsResponse = await fetch(`${OPENWEBUI_URL}/api/v1/retrieval/collections`, {
+        headers: { 'Authorization': `Bearer ${apiKey}` }
+      });
+
+      if (collectionsResponse.ok) {
+        const collections = await collectionsResponse.json();
+        debug.checks.availableCollections = collections;
+      } else {
+        debug.checks.availableCollections = {
+          status: 'error',
+          statusCode: collectionsResponse.status
+        };
+      }
+    } catch (err) {
+      debug.checks.availableCollections = { status: 'endpoint_not_available', error: err.message };
+    }
+
+    console.log(`[DEBUG-RAG] Diagnóstico completado`);
+    res.json(debug);
+
+  } catch (error) {
+    console.error('[DEBUG-RAG] Error:', error.message);
+    res.status(500).json({
+      error: 'Error en diagnóstico RAG',
+      message: error.message
+    });
+  }
+});
+
+/**
  * Retrieval-only: Obtiene fragmentos relevantes sin generación
  * POST /retrieve-only
  * Body: { query: string, knowledgeId?: string, topK?: number }
@@ -887,92 +1061,159 @@ app.post('/retrieve-only', async (req, res) => {
 
     console.log(`[RAG] Retrieval-only para: "${query}" (top ${topK})`);
 
-    // Usar el endpoint de retrieval de Open WebUI
-    // POST /api/v1/retrieval/query
-    const retrievalResponse = await fetch(`${OPENWEBUI_URL}/api/v1/retrieval/query`, {
-      method: 'POST',
-      headers: {
-        'Authorization': `Bearer ${apiKey}`,
-        'Content-Type': 'application/json'
-      },
-      body: JSON.stringify({
-        collection_names: [kbId],
-        query: query,
-        k: topK
-      })
-    });
+    // Estrategia 1: Intentar retrieval vectorial con diferentes formatos de collection_name
+    const collectionFormats = [
+      kbId,                    // ID directo
+      `file-${kbId}`,          // Con prefijo file-
+    ];
 
-    if (!retrievalResponse.ok) {
-      // Si falla el endpoint de retrieval, intentar método alternativo
-      console.log(`[RAG] Endpoint /api/v1/retrieval/query no disponible, intentando alternativa...`);
+    let retrievalSuccess = false;
+    let chunks = [];
+    let usedMethod = 'none';
 
-      // Método alternativo: obtener los archivos de la KB y buscar en ellos
-      const kbResponse = await fetch(`${OPENWEBUI_URL}/api/v1/knowledge/${kbId}`, {
-        headers: { 'Authorization': `Bearer ${apiKey}` }
-      });
+    for (const collectionName of collectionFormats) {
+      if (retrievalSuccess) break;
 
-      if (!kbResponse.ok) {
-        throw new Error(`Error obteniendo Knowledge Base: ${kbResponse.status}`);
-      }
+      try {
+        console.log(`[RAG] Probando collection_name: ${collectionName}`);
 
-      const kbData = await kbResponse.json();
+        const retrievalResponse = await fetch(`${OPENWEBUI_URL}/api/v1/retrieval/query`, {
+          method: 'POST',
+          headers: {
+            'Authorization': `Bearer ${apiKey}`,
+            'Content-Type': 'application/json'
+          },
+          body: JSON.stringify({
+            collection_names: [collectionName],
+            query: query,
+            k: topK
+          })
+        });
 
-      // Obtener contenido de los archivos
-      const chunks = [];
-      if (kbData.files && kbData.files.length > 0) {
-        for (const file of kbData.files.slice(0, 5)) { // Limitar a 5 archivos
-          try {
-            const fileResponse = await fetch(`${OPENWEBUI_URL}/api/v1/files/${file.id}`, {
-              headers: { 'Authorization': `Bearer ${apiKey}` }
-            });
+        if (retrievalResponse.ok) {
+          const retrievalData = await retrievalResponse.json();
+          const documents = retrievalData.documents || retrievalData.results || [];
 
-            if (fileResponse.ok) {
-              const fileData = await fileResponse.json();
-              if (fileData.data && fileData.data.content) {
-                // Agregar fragmento con metadatos
-                chunks.push({
-                  content: fileData.data.content.substring(0, 2000), // Limitar tamaño
-                  filename: fileData.filename || file.filename || 'unknown',
-                  fileId: file.id,
-                  source: 'file_content'
-                });
-              }
-            }
-          } catch (err) {
-            console.warn(`[RAG] Error obteniendo archivo ${file.id}:`, err.message);
+          if (documents.length > 0) {
+            chunks = documents.map((doc, index) => ({
+              content: typeof doc === 'string' ? doc : (doc.content || doc.text || doc.page_content || JSON.stringify(doc)),
+              metadata: typeof doc === 'object' ? (doc.metadata || {}) : {},
+              score: doc.score || doc.distance || null,
+              source: 'vector_search',
+              collectionName: collectionName,
+              index: index
+            }));
+            retrievalSuccess = true;
+            usedMethod = 'vector_retrieval';
+            console.log(`[RAG] Retrieval exitoso con ${collectionName}: ${chunks.length} documentos`);
+          } else {
+            console.log(`[RAG] Collection ${collectionName}: respuesta OK pero 0 documentos`);
           }
+        } else {
+          console.log(`[RAG] Collection ${collectionName}: error ${retrievalResponse.status}`);
         }
+      } catch (err) {
+        console.log(`[RAG] Collection ${collectionName}: excepción - ${err.message}`);
       }
-
-      console.log(`[RAG] Método alternativo: ${chunks.length} fragmentos de archivos`);
-
-      return res.json({
-        success: true,
-        method: 'file_content',
-        query: query,
-        chunks: chunks,
-        knowledgeBaseId: kbId,
-        knowledgeBaseName: kbData.name || kbId
-      });
     }
 
-    // Procesar respuesta del endpoint de retrieval
-    const retrievalData = await retrievalResponse.json();
-    console.log(`[RAG] Retrieval exitoso: ${retrievalData.documents?.length || retrievalData.results?.length || 0} documentos`);
+    // Estrategia 2: Si no hay resultados vectoriales, obtener contenido de archivos directamente
+    if (!retrievalSuccess || chunks.length === 0) {
+      console.log(`[RAG] Retrieval vectorial sin resultados, obteniendo archivos directamente...`);
 
-    // Normalizar la respuesta
-    const documents = retrievalData.documents || retrievalData.results || [];
-    const chunks = documents.map((doc, index) => ({
-      content: typeof doc === 'string' ? doc : (doc.content || doc.text || doc.page_content || JSON.stringify(doc)),
-      metadata: typeof doc === 'object' ? (doc.metadata || {}) : {},
-      score: doc.score || doc.distance || null,
-      source: 'vector_search',
-      index: index
-    }));
+      try {
+        const kbResponse = await fetch(`${OPENWEBUI_URL}/api/v1/knowledge/${kbId}`, {
+          headers: { 'Authorization': `Bearer ${apiKey}` }
+        });
+
+        if (kbResponse.ok) {
+          const kbData = await kbResponse.json();
+          console.log(`[RAG] KB ${kbData.name}: ${kbData.files?.length || 0} archivos`);
+
+          if (kbData.files && kbData.files.length > 0) {
+            for (const file of kbData.files.slice(0, 5)) {
+              try {
+                // Obtener ID real del archivo (puede estar en diferentes propiedades)
+                const fileId = file.id || file.file_id;
+                console.log(`[RAG] Obteniendo archivo: ${fileId} (${file.filename || file.meta?.name || 'unknown'})`);
+
+                const fileResponse = await fetch(`${OPENWEBUI_URL}/api/v1/files/${fileId}`, {
+                  headers: { 'Authorization': `Bearer ${apiKey}` }
+                });
+
+                if (fileResponse.ok) {
+                  const fileData = await fileResponse.json();
+                  console.log(`[RAG] Archivo ${fileId}: data.content = ${fileData.data?.content ? 'SI' : 'NO'} (${fileData.data?.content?.length || 0} chars)`);
+
+                  if (fileData.data && fileData.data.content) {
+                    // Dividir contenido largo en chunks de ~1500 caracteres
+                    const content = fileData.data.content;
+                    const chunkSize = 1500;
+
+                    if (content.length <= chunkSize) {
+                      chunks.push({
+                        content: content,
+                        filename: fileData.filename || file.filename || file.meta?.name || 'unknown',
+                        fileId: fileId,
+                        source: 'file_content',
+                        chunkIndex: 0
+                      });
+                    } else {
+                      // Dividir en múltiples chunks
+                      const maxChunks = Math.min(Math.ceil(content.length / chunkSize), topK);
+                      for (let i = 0; i < maxChunks; i++) {
+                        chunks.push({
+                          content: content.substring(i * chunkSize, (i + 1) * chunkSize),
+                          filename: fileData.filename || file.filename || file.meta?.name || 'unknown',
+                          fileId: fileId,
+                          source: 'file_content',
+                          chunkIndex: i
+                        });
+                      }
+                    }
+                    usedMethod = 'file_content';
+                  }
+                } else {
+                  console.log(`[RAG] Error obteniendo archivo ${fileId}: ${fileResponse.status}`);
+                }
+              } catch (err) {
+                console.warn(`[RAG] Error procesando archivo:`, err.message);
+              }
+            }
+          }
+
+          // Si aún no hay chunks, buscar en data de la KB
+          if (chunks.length === 0 && kbData.data) {
+            console.log(`[RAG] Buscando en data de KB...`);
+            if (typeof kbData.data === 'string' && kbData.data.length > 0) {
+              chunks.push({
+                content: kbData.data.substring(0, 3000),
+                filename: kbData.name,
+                source: 'knowledge_base_data'
+              });
+              usedMethod = 'kb_data';
+            } else if (kbData.data.content) {
+              chunks.push({
+                content: kbData.data.content.substring(0, 3000),
+                filename: kbData.name,
+                source: 'knowledge_base_data'
+              });
+              usedMethod = 'kb_data';
+            }
+          }
+        } else {
+          console.log(`[RAG] Error obteniendo KB: ${kbResponse.status}`);
+        }
+      } catch (err) {
+        console.warn(`[RAG] Error en método alternativo:`, err.message);
+      }
+    }
+
+    console.log(`[RAG] Resultado final: ${chunks.length} chunks (método: ${usedMethod})`);
 
     res.json({
       success: true,
-      method: 'vector_retrieval',
+      method: usedMethod,
       query: query,
       chunks: chunks,
       knowledgeBaseId: kbId,
