@@ -1,11 +1,14 @@
 /**
  * SearXNG Proxy Server
- * Version: 1.2.2
+ * Version: 1.2.3
  * Last Update: 2026-01-25
  *
+ * Cambios v1.2.3:
+ * - Corregido upload a Open WebUI: usar http/https nativo con form-data.pipe()
+ * - fetch nativo de Node.js no maneja bien FormData multipart
+ *
  * Cambios v1.2.2:
- * - Corregido upload a Open WebUI: usar stream con knownLength para FormData
- * - FastAPI/Starlette requiere el Content-Length correcto en multipart
+ * - Intento fallido con stream + knownLength (fetch no lo soporta bien)
  *
  * Cambios v1.2.1:
  * - Mejorada descarga de PDFs: sigue redirecciones y extrae URL real de páginas intermedias
@@ -30,10 +33,9 @@ const express = require('express');
 const cors = require('cors');
 const cheerio = require('cheerio');
 const FormData = require('form-data');
-const { Readable } = require('stream');
 
-const VERSION = '1.2.2';
-const BUILD_DATE = '2026-01-25T20:00:00Z';
+const VERSION = '1.2.3';
+const BUILD_DATE = '2026-01-25T21:00:00Z';
 
 // Puppeteer es opcional - cargarlo dinámicamente solo cuando se necesite
 let puppeteer = null;
@@ -667,34 +669,54 @@ app.post('/upload-to-rag', async (req, res) => {
 
     console.log(`[RAG] PDF descargado: ${pdfFilename} (${pdfBuffer.length} bytes)`);
 
-    // 2. Crear FormData para subir a Open WebUI
-    // Open WebUI (FastAPI) requiere stream con knownLength para multipart
-    const formData = new FormData();
-    const pdfStream = Readable.from(pdfBuffer);
-    formData.append('file', pdfStream, {
-      filename: pdfFilename,
-      contentType: 'application/pdf',
-      knownLength: pdfBuffer.length
-    });
-
-    // 3. Subir a Open WebUI Files API
+    // 2. Subir a Open WebUI Files API usando form-data submit (más confiable que fetch)
     console.log(`[RAG] Subiendo a Open WebUI: ${OPENWEBUI_URL} (${pdfBuffer.length} bytes)`);
 
-    const uploadResponse = await fetch(`${OPENWEBUI_URL}/api/v1/files/`, {
-      method: 'POST',
-      headers: {
-        'Authorization': `Bearer ${apiKey}`,
-        ...formData.getHeaders()
-      },
-      body: formData
+    const uploadResult = await new Promise((resolve, reject) => {
+      const formData = new FormData();
+      formData.append('file', pdfBuffer, {
+        filename: pdfFilename,
+        contentType: 'application/pdf',
+        knownLength: pdfBuffer.length
+      });
+
+      const uploadUrl = new URL(`${OPENWEBUI_URL}/api/v1/files/`);
+      const options = {
+        protocol: uploadUrl.protocol,
+        host: uploadUrl.hostname,
+        port: uploadUrl.port || (uploadUrl.protocol === 'https:' ? 443 : 80),
+        path: uploadUrl.pathname,
+        method: 'POST',
+        headers: {
+          'Authorization': `Bearer ${apiKey}`,
+          ...formData.getHeaders()
+        }
+      };
+
+      const httpModule = uploadUrl.protocol === 'https:' ? require('https') : require('http');
+
+      const req = httpModule.request(options, (response) => {
+        let data = '';
+        response.on('data', chunk => data += chunk);
+        response.on('end', () => {
+          if (response.statusCode >= 200 && response.statusCode < 300) {
+            try {
+              resolve(JSON.parse(data));
+            } catch (e) {
+              reject(new Error(`Error parseando respuesta: ${data}`));
+            }
+          } else {
+            reject(new Error(`Error subiendo a Open WebUI: ${response.statusCode} - ${data}`));
+          }
+        });
+      });
+
+      req.on('error', (error) => {
+        reject(new Error(`Error de conexión: ${error.message}`));
+      });
+
+      formData.pipe(req);
     });
-
-    if (!uploadResponse.ok) {
-      const errorText = await uploadResponse.text();
-      throw new Error(`Error subiendo a Open WebUI: ${uploadResponse.status} - ${errorText}`);
-    }
-
-    const uploadResult = await uploadResponse.json();
     console.log(`[RAG] Archivo subido con ID:`, uploadResult.id);
 
     // 4. Esperar a que el archivo sea procesado
