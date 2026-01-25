@@ -1,7 +1,11 @@
 /**
  * SearXNG Proxy Server
- * Version: 1.1.1
+ * Version: 1.2.0
  * Last Update: 2026-01-25
+ *
+ * Cambios v1.2.0:
+ * - Mejorada detección de PDFs: ahora detecta enlaces dinámicos (sdm_process_download, etc.)
+ * - Detecta PDFs por texto del enlace (descargar, boletín, informe)
  *
  * Cambios v1.1.1:
  * - /info ahora requiere token (INFO_TOKEN) para acceso
@@ -18,8 +22,8 @@ const cors = require('cors');
 const cheerio = require('cheerio');
 const FormData = require('form-data');
 
-const VERSION = '1.1.1';
-const BUILD_DATE = '2026-01-25T17:10:00Z';
+const VERSION = '1.2.0';
+const BUILD_DATE = '2026-01-25T18:30:00Z';
 
 // Puppeteer es opcional - cargarlo dinámicamente solo cuando se necesite
 let puppeteer = null;
@@ -239,12 +243,47 @@ app.get('/fetch', async (req, res) => {
 
     // Extraer enlaces relevantes (PDFs, Excel, etc)
     const downloadLinks = [];
+    const seenUrls = new Set(); // Evitar duplicados
+
     $('a[href]').each((i, a) => {
       const href = $(a).attr('href');
-      const text = $(a).text().trim();
-      if (href && (href.endsWith('.pdf') || href.endsWith('.xlsx') || href.endsWith('.xls') || href.endsWith('.csv'))) {
+      const text = $(a).text().trim().toLowerCase();
+      const hrefLower = (href || '').toLowerCase();
+
+      if (!href) return;
+
+      let type = null;
+
+      // Detección por extensión de archivo
+      if (hrefLower.endsWith('.pdf')) type = 'pdf';
+      else if (hrefLower.endsWith('.xlsx')) type = 'xlsx';
+      else if (hrefLower.endsWith('.xls')) type = 'xls';
+      else if (hrefLower.endsWith('.csv')) type = 'csv';
+      // Detección por patrones de descarga en la URL
+      else if (hrefLower.includes('download') && (text.includes('pdf') || hrefLower.includes('pdf'))) type = 'pdf';
+      else if (hrefLower.includes('sdm_process_download')) type = 'pdf'; // WordPress Download Manager
+      else if (hrefLower.includes('/descargar') || hrefLower.includes('/download')) {
+        // Inferir tipo del texto del enlace
+        if (text.includes('pdf')) type = 'pdf';
+        else if (text.includes('excel') || text.includes('xlsx')) type = 'xlsx';
+        else type = 'pdf'; // Default a PDF para enlaces de descarga
+      }
+      // Detección por texto del enlace que indica descarga
+      else if ((text.includes('descargar') || text.includes('download')) &&
+               (text.includes('pdf') || text.includes('boletín') || text.includes('informe') || text.includes('reporte'))) {
+        type = 'pdf';
+      }
+
+      if (type) {
         const fullUrl = href.startsWith('http') ? href : new URL(href, url).href;
-        downloadLinks.push({ text: text || href, url: fullUrl, type: href.split('.').pop() });
+        if (!seenUrls.has(fullUrl)) {
+          seenUrls.add(fullUrl);
+          downloadLinks.push({
+            text: $(a).text().trim() || href,
+            url: fullUrl,
+            type
+          });
+        }
       }
     });
 
@@ -401,14 +440,47 @@ app.get('/fetch-js', async (req, res) => {
       }
     });
 
-    // Extraer enlaces de descarga
+    // Extraer enlaces de descarga (mejorado para detectar enlaces dinámicos)
     const downloadLinks = [];
+    const seenUrls = new Set();
+
     $('a[href]').each((i, a) => {
       const href = $(a).attr('href');
-      const text = $(a).text().trim();
-      if (href && (href.endsWith('.pdf') || href.endsWith('.xlsx') || href.endsWith('.xls') || href.endsWith('.csv'))) {
+      const text = $(a).text().trim().toLowerCase();
+      const hrefLower = (href || '').toLowerCase();
+
+      if (!href) return;
+
+      let type = null;
+
+      // Detección por extensión
+      if (hrefLower.endsWith('.pdf')) type = 'pdf';
+      else if (hrefLower.endsWith('.xlsx')) type = 'xlsx';
+      else if (hrefLower.endsWith('.xls')) type = 'xls';
+      else if (hrefLower.endsWith('.csv')) type = 'csv';
+      // Detección por patrones de descarga
+      else if (hrefLower.includes('download') && (text.includes('pdf') || hrefLower.includes('pdf'))) type = 'pdf';
+      else if (hrefLower.includes('sdm_process_download')) type = 'pdf';
+      else if (hrefLower.includes('/descargar') || hrefLower.includes('/download')) {
+        if (text.includes('pdf')) type = 'pdf';
+        else if (text.includes('excel') || text.includes('xlsx')) type = 'xlsx';
+        else type = 'pdf';
+      }
+      else if ((text.includes('descargar') || text.includes('download')) &&
+               (text.includes('pdf') || text.includes('boletín') || text.includes('informe') || text.includes('reporte'))) {
+        type = 'pdf';
+      }
+
+      if (type) {
         const fullUrl = href.startsWith('http') ? href : new URL(href, url).href;
-        downloadLinks.push({ text: text || href, url: fullUrl, type: href.split('.').pop() });
+        if (!seenUrls.has(fullUrl)) {
+          seenUrls.add(fullUrl);
+          downloadLinks.push({
+            text: $(a).text().trim() || href,
+            url: fullUrl,
+            type
+          });
+        }
       }
     });
 
