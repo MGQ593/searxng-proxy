@@ -1,7 +1,22 @@
+/**
+ * SearXNG Proxy Server
+ * Version: 1.1.0
+ * Last Update: 2026-01-25
+ *
+ * Cambios v1.1.0:
+ * - Puppeteer ahora es opcional (carga dinámica)
+ * - Agregado endpoint /info para debugging
+ * - Mejor manejo de errores y SIGTERM
+ * - Integración con Open WebUI RAG
+ */
+
 const express = require('express');
 const cors = require('cors');
 const cheerio = require('cheerio');
 const FormData = require('form-data');
+
+const VERSION = '1.1.0';
+const BUILD_DATE = '2026-01-25T17:00:00Z';
 
 // Puppeteer es opcional - cargarlo dinámicamente solo cuando se necesite
 let puppeteer = null;
@@ -38,12 +53,13 @@ app.get('/health', (req, res) => {
   res.json({ status: 'ok', timestamp: new Date().toISOString() });
 });
 
-// Info endpoint for debugging
+// Info endpoint for debugging - USAR PARA VERIFICAR VERSION
 app.get('/info', async (req, res) => {
   const pup = await getPuppeteer();
   res.json({
     status: 'ok',
-    version: '1.0.0',
+    version: VERSION,
+    buildDate: BUILD_DATE,
     timestamp: new Date().toISOString(),
     config: {
       searxngUrl: SEARXNG_URL,
@@ -756,7 +772,8 @@ process.on('SIGINT', () => {
 // Start server
 const server = app.listen(PORT, '0.0.0.0', () => {
   console.log('========================================');
-  console.log(`SearXNG Proxy running on port ${PORT}`);
+  console.log(`SearXNG Proxy v${VERSION} (${BUILD_DATE})`);
+  console.log(`Running on port ${PORT}`);
   console.log(`Proxying to: ${SEARXNG_URL}`);
   console.log(`Open WebUI RAG: ${OPENWEBUI_URL}`);
   console.log(`API Key configured: ${OPENWEBUI_API_KEY ? 'Yes' : 'No'}`);
