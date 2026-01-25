@@ -1,7 +1,11 @@
 /**
  * SearXNG Proxy Server
- * Version: 1.2.1
+ * Version: 1.2.2
  * Last Update: 2026-01-25
+ *
+ * Cambios v1.2.2:
+ * - Corregido upload a Open WebUI: usar stream con knownLength para FormData
+ * - FastAPI/Starlette requiere el Content-Length correcto en multipart
  *
  * Cambios v1.2.1:
  * - Mejorada descarga de PDFs: sigue redirecciones y extrae URL real de páginas intermedias
@@ -26,9 +30,10 @@ const express = require('express');
 const cors = require('cors');
 const cheerio = require('cheerio');
 const FormData = require('form-data');
+const { Readable } = require('stream');
 
-const VERSION = '1.2.1';
-const BUILD_DATE = '2026-01-25T19:00:00Z';
+const VERSION = '1.2.2';
+const BUILD_DATE = '2026-01-25T20:00:00Z';
 
 // Puppeteer es opcional - cargarlo dinámicamente solo cuando se necesite
 let puppeteer = null;
@@ -663,14 +668,17 @@ app.post('/upload-to-rag', async (req, res) => {
     console.log(`[RAG] PDF descargado: ${pdfFilename} (${pdfBuffer.length} bytes)`);
 
     // 2. Crear FormData para subir a Open WebUI
+    // Open WebUI (FastAPI) requiere stream con knownLength para multipart
     const formData = new FormData();
-    formData.append('file', pdfBuffer, {
+    const pdfStream = Readable.from(pdfBuffer);
+    formData.append('file', pdfStream, {
       filename: pdfFilename,
-      contentType: 'application/pdf'
+      contentType: 'application/pdf',
+      knownLength: pdfBuffer.length
     });
 
     // 3. Subir a Open WebUI Files API
-    console.log(`[RAG] Subiendo a Open WebUI: ${OPENWEBUI_URL}`);
+    console.log(`[RAG] Subiendo a Open WebUI: ${OPENWEBUI_URL} (${pdfBuffer.length} bytes)`);
 
     const uploadResponse = await fetch(`${OPENWEBUI_URL}/api/v1/files/`, {
       method: 'POST',
