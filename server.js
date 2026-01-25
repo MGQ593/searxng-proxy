@@ -1,7 +1,12 @@
 /**
  * SearXNG Proxy Server
- * Version: 1.2.0
+ * Version: 1.2.1
  * Last Update: 2026-01-25
+ *
+ * Cambios v1.2.1:
+ * - Mejorada descarga de PDFs: sigue redirecciones y extrae URL real de páginas intermedias
+ * - Verifica Content-Type y header PDF válido
+ * - Extrae nombre de archivo de Content-Disposition
  *
  * Cambios v1.2.0:
  * - Mejorada detección de PDFs: ahora detecta enlaces dinámicos (sdm_process_download, etc.)
@@ -22,8 +27,8 @@ const cors = require('cors');
 const cheerio = require('cheerio');
 const FormData = require('form-data');
 
-const VERSION = '1.2.0';
-const BUILD_DATE = '2026-01-25T18:30:00Z';
+const VERSION = '1.2.1';
+const BUILD_DATE = '2026-01-25T19:00:00Z';
 
 // Puppeteer es opcional - cargarlo dinámicamente solo cuando se necesite
 let puppeteer = null;
@@ -571,19 +576,89 @@ app.post('/upload-to-rag', async (req, res) => {
 
     console.log(`[RAG] Descargando PDF: ${pdfUrl}`);
 
-    // 1. Descargar el PDF
-    const pdfResponse = await fetch(pdfUrl, {
+    // 1. Descargar el PDF (siguiendo redirecciones)
+    let pdfResponse = await fetch(pdfUrl, {
       headers: {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
-      }
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+        'Accept': 'application/pdf,*/*'
+      },
+      redirect: 'follow'
     });
 
     if (!pdfResponse.ok) {
       throw new Error(`Error descargando PDF: ${pdfResponse.status}`);
     }
 
+    // Verificar el Content-Type
+    const contentType = pdfResponse.headers.get('content-type') || '';
+    console.log(`[RAG] Content-Type recibido: ${contentType}`);
+
+    // Si es HTML, puede ser una página de descarga - intentar extraer el link real
+    if (contentType.includes('text/html')) {
+      const htmlContent = await pdfResponse.text();
+
+      // Buscar meta refresh o link directo al PDF
+      const metaRefreshMatch = htmlContent.match(/url=([^"'\s>]+\.pdf[^"'\s>]*)/i);
+      const directLinkMatch = htmlContent.match(/href=["']([^"']+\.pdf[^"']*)["']/i);
+
+      let realPdfUrl = null;
+      if (metaRefreshMatch) {
+        realPdfUrl = metaRefreshMatch[1];
+      } else if (directLinkMatch) {
+        realPdfUrl = directLinkMatch[1];
+      }
+
+      if (realPdfUrl) {
+        // Construir URL completa si es relativa
+        if (!realPdfUrl.startsWith('http')) {
+          const baseUrl = new URL(pdfUrl);
+          realPdfUrl = new URL(realPdfUrl, baseUrl.origin).href;
+        }
+
+        console.log(`[RAG] Redirigiendo a PDF real: ${realPdfUrl}`);
+        pdfResponse = await fetch(realPdfUrl, {
+          headers: {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+            'Accept': 'application/pdf,*/*'
+          },
+          redirect: 'follow'
+        });
+
+        if (!pdfResponse.ok) {
+          throw new Error(`Error descargando PDF real: ${pdfResponse.status}`);
+        }
+      } else {
+        throw new Error('El enlace no apunta a un PDF válido. Recibido: HTML sin link a PDF');
+      }
+    }
+
     const pdfBuffer = Buffer.from(await pdfResponse.arrayBuffer());
-    const pdfFilename = filename || decodeURIComponent(pdfUrl.split('/').pop().split('?')[0]) || 'document.pdf';
+
+    // Verificar que sea un PDF válido (los PDFs empiezan con %PDF)
+    const pdfHeader = pdfBuffer.slice(0, 5).toString();
+    if (!pdfHeader.startsWith('%PDF')) {
+      console.warn(`[RAG] Advertencia: El archivo no parece ser un PDF válido. Header: ${pdfHeader}`);
+    }
+
+    // Obtener nombre del archivo
+    let pdfFilename = filename;
+    if (!pdfFilename) {
+      // Intentar obtener de Content-Disposition
+      const contentDisposition = pdfResponse.headers.get('content-disposition');
+      if (contentDisposition) {
+        const filenameMatch = contentDisposition.match(/filename[*]?=["']?(?:UTF-8'')?([^"';\n]+)/i);
+        if (filenameMatch) {
+          pdfFilename = decodeURIComponent(filenameMatch[1]);
+        }
+      }
+    }
+    if (!pdfFilename) {
+      pdfFilename = decodeURIComponent(pdfUrl.split('/').pop().split('?')[0]) || 'document.pdf';
+    }
+    // Asegurar extensión .pdf
+    if (!pdfFilename.toLowerCase().endsWith('.pdf')) {
+      pdfFilename += '.pdf';
+    }
 
     console.log(`[RAG] PDF descargado: ${pdfFilename} (${pdfBuffer.length} bytes)`);
 
