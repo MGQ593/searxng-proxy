@@ -25,8 +25,8 @@ RUN apt-get update && apt-get install -y \
     --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
-# Configurar Puppeteer para usar Chromium del sistema
-ENV PUPPETEER_SKIP_CHROMIUM_DOWNLOAD=true
+# Configurar puppeteer-core para usar Chromium del sistema
+ENV CHROME_PATH=/usr/bin/chromium
 ENV PUPPETEER_EXECUTABLE_PATH=/usr/bin/chromium
 
 # Copiar package.json primero para aprovechar cache de Docker

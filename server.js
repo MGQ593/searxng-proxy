@@ -1,7 +1,12 @@
 /**
  * SearXNG Proxy Server
- * Version: 1.2.6
- * Last Update: 2026-01-25
+ * Version: 1.3.0
+ * Last Update: 2026-01-26
+ *
+ * Cambios v1.3.0:
+ * - Nuevo endpoint /upload-file para múltiples formatos (PDF, DOCX, XLSX, CSV, TXT)
+ * - Soporte para mammoth (DOCX) y xlsx (Excel) libraries
+ * - Extracción de texto de documentos para contexto AI
  *
  * Cambios v1.2.7:
  * - Fallback a todos los archivos de Open WebUI si la KB está vacía
@@ -52,22 +57,80 @@ const cors = require('cors');
 const cheerio = require('cheerio');
 const FormData = require('form-data');
 
-const VERSION = '1.2.7';
-const BUILD_DATE = '2026-01-26T01:00:00Z';
+const VERSION = '1.3.0';
+const BUILD_DATE = '2026-01-26T02:00:00Z';
+
+// Document processing libraries (optional, load dynamically)
+let mammoth = null;
+let XLSX = null;
+
+async function getMammoth() {
+  if (!mammoth) {
+    try {
+      mammoth = require('mammoth');
+      console.log('[Mammoth] Loaded successfully');
+    } catch (error) {
+      console.warn('[Mammoth] Not available:', error.message);
+      return null;
+    }
+  }
+  return mammoth;
+}
+
+async function getXLSX() {
+  if (!XLSX) {
+    try {
+      XLSX = require('xlsx');
+      console.log('[XLSX] Loaded successfully');
+    } catch (error) {
+      console.warn('[XLSX] Not available:', error.message);
+      return null;
+    }
+  }
+  return XLSX;
+}
 
 // Puppeteer es opcional - cargarlo dinámicamente solo cuando se necesite
+// Usamos puppeteer-core para evitar descarga automática de Chrome
 let puppeteer = null;
 async function getPuppeteer() {
   if (!puppeteer) {
     try {
-      puppeteer = require('puppeteer');
-      console.log('[Puppeteer] Loaded successfully');
+      puppeteer = require('puppeteer-core');
+      console.log('[Puppeteer] puppeteer-core loaded successfully');
     } catch (error) {
       console.warn('[Puppeteer] Not available:', error.message);
       return null;
     }
   }
   return puppeteer;
+}
+
+// Helper para encontrar Chrome en el sistema
+function findChromePath() {
+  const possiblePaths = [
+    // Windows
+    'C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe',
+    'C:\\Program Files (x86)\\Google\\Chrome\\Application\\chrome.exe',
+    process.env.LOCALAPPDATA + '\\Google\\Chrome\\Application\\chrome.exe',
+    // Linux
+    '/usr/bin/google-chrome',
+    '/usr/bin/chromium-browser',
+    '/usr/bin/chromium',
+    // macOS
+    '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome',
+    // Environment variable override
+    process.env.PUPPETEER_EXECUTABLE_PATH,
+    process.env.CHROME_PATH
+  ];
+
+  const fs = require('fs');
+  for (const p of possiblePaths) {
+    if (p && fs.existsSync(p)) {
+      return p;
+    }
+  }
+  return null;
 }
 
 const app = express();
@@ -362,8 +425,21 @@ app.get('/fetch-js', async (req, res) => {
 
     console.log(`[FetchJS] Obteniendo con Puppeteer: ${url}`);
 
-    // Iniciar browser con configuración para Docker
+    // Buscar Chrome en el sistema
+    const chromePath = findChromePath();
+    if (!chromePath) {
+      return res.status(503).json({
+        error: 'Chrome not found',
+        message: 'No se encontró Chrome/Chromium instalado en el sistema. Use /fetch para contenido estático.',
+        suggestion: 'Instale Google Chrome o configure CHROME_PATH variable de entorno'
+      });
+    }
+
+    console.log(`[FetchJS] Usando Chrome: ${chromePath}`);
+
+    // Iniciar browser con configuración para Docker/Windows
     const launchOptions = {
+      executablePath: chromePath,
       headless: 'new',
       args: [
         '--no-sandbox',
@@ -376,11 +452,6 @@ app.get('/fetch-js', async (req, res) => {
         '--window-size=1920x1080'
       ]
     };
-
-    // Usar Chromium del sistema si está configurado
-    if (process.env.PUPPETEER_EXECUTABLE_PATH) {
-      launchOptions.executablePath = process.env.PUPPETEER_EXECUTABLE_PATH;
-    }
 
     browser = await pup.launch(launchOptions);
 
@@ -548,6 +619,346 @@ app.get('/fetch-js', async (req, res) => {
 function getApiKey(reqApiKey) {
   return OPENWEBUI_API_KEY || reqApiKey;
 }
+
+/**
+ * Helper: Extrae texto de diferentes tipos de archivo
+ */
+async function extractTextFromFile(buffer, filename, mimeType) {
+  const ext = filename.toLowerCase().split('.').pop();
+
+  // PDF - usar pdf-parse si está disponible, o devolver indicación
+  if (ext === 'pdf' || mimeType === 'application/pdf') {
+    try {
+      const pdfParse = require('pdf-parse');
+      const data = await pdfParse(buffer);
+      return {
+        success: true,
+        text: data.text,
+        pages: data.numpages,
+        type: 'pdf'
+      };
+    } catch (error) {
+      // Si pdf-parse no está disponible, devolver buffer para subir a Open WebUI
+      console.log('[Extract] pdf-parse no disponible, se subirá directamente a Open WebUI');
+      return {
+        success: true,
+        text: null,
+        uploadToOpenWebUI: true,
+        type: 'pdf'
+      };
+    }
+  }
+
+  // DOCX - usar mammoth
+  if (ext === 'docx' || mimeType === 'application/vnd.openxmlformats-officedocument.wordprocessingml.document') {
+    const mammothLib = await getMammoth();
+    if (!mammothLib) {
+      return { success: false, error: 'mammoth library not installed. Run: npm install mammoth' };
+    }
+
+    try {
+      const result = await mammothLib.extractRawText({ buffer: buffer });
+      return {
+        success: true,
+        text: result.value,
+        messages: result.messages,
+        type: 'docx'
+      };
+    } catch (error) {
+      return { success: false, error: `Error procesando DOCX: ${error.message}` };
+    }
+  }
+
+  // XLSX/XLS - usar xlsx
+  if (ext === 'xlsx' || ext === 'xls' ||
+      mimeType === 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' ||
+      mimeType === 'application/vnd.ms-excel') {
+    const xlsxLib = await getXLSX();
+    if (!xlsxLib) {
+      return { success: false, error: 'xlsx library not installed. Run: npm install xlsx' };
+    }
+
+    try {
+      const workbook = xlsxLib.read(buffer, { type: 'buffer' });
+      const sheets = {};
+      let allText = [];
+
+      for (const sheetName of workbook.SheetNames) {
+        const sheet = workbook.Sheets[sheetName];
+        // Convertir a CSV para texto legible
+        const csv = xlsxLib.utils.sheet_to_csv(sheet);
+        sheets[sheetName] = csv;
+        allText.push(`=== Hoja: ${sheetName} ===\n${csv}`);
+      }
+
+      return {
+        success: true,
+        text: allText.join('\n\n'),
+        sheets: sheets,
+        sheetNames: workbook.SheetNames,
+        type: 'xlsx'
+      };
+    } catch (error) {
+      return { success: false, error: `Error procesando Excel: ${error.message}` };
+    }
+  }
+
+  // CSV - lectura directa
+  if (ext === 'csv' || mimeType === 'text/csv') {
+    try {
+      const text = buffer.toString('utf-8');
+      return {
+        success: true,
+        text: text,
+        type: 'csv'
+      };
+    } catch (error) {
+      return { success: false, error: `Error procesando CSV: ${error.message}` };
+    }
+  }
+
+  // TXT y otros archivos de texto
+  if (ext === 'txt' || ext === 'md' || ext === 'json' || ext === 'xml' ||
+      mimeType?.startsWith('text/') || mimeType === 'application/json') {
+    try {
+      const text = buffer.toString('utf-8');
+      return {
+        success: true,
+        text: text,
+        type: ext
+      };
+    } catch (error) {
+      return { success: false, error: `Error procesando archivo de texto: ${error.message}` };
+    }
+  }
+
+  return {
+    success: false,
+    error: `Tipo de archivo no soportado: ${ext} (${mimeType})`
+  };
+}
+
+/**
+ * Endpoint para subir archivos y extraer texto
+ * POST /upload-file
+ * Body: {
+ *   file: string (base64),
+ *   filename: string,
+ *   mimeType?: string,
+ *   uploadToRag?: boolean,
+ *   knowledgeId?: string
+ * }
+ *
+ * Soporta: PDF, DOCX, XLSX, XLS, CSV, TXT, MD, JSON, XML
+ */
+app.post('/upload-file', async (req, res) => {
+  try {
+    const { file, filename, mimeType, uploadToRag, knowledgeId } = req.body;
+    const apiKey = getApiKey(req.body.apiKey);
+    const kbId = knowledgeId || OPENWEBUI_KNOWLEDGE_ID;
+
+    if (!file) {
+      return res.status(400).json({ error: 'file (base64) is required' });
+    }
+
+    if (!filename) {
+      return res.status(400).json({ error: 'filename is required' });
+    }
+
+    console.log(`[Upload] Procesando archivo: ${filename}`);
+
+    // Decodificar base64
+    const buffer = Buffer.from(file, 'base64');
+    console.log(`[Upload] Tamaño: ${buffer.length} bytes`);
+
+    // Extraer texto del archivo
+    const extraction = await extractTextFromFile(buffer, filename, mimeType);
+
+    if (!extraction.success) {
+      return res.status(400).json({
+        success: false,
+        error: extraction.error,
+        filename: filename
+      });
+    }
+
+    // Si es PDF y necesita subirse a Open WebUI para procesamiento
+    if (extraction.uploadToOpenWebUI && uploadToRag && apiKey) {
+      console.log(`[Upload] Subiendo PDF a Open WebUI para procesamiento...`);
+
+      // Usar el flujo existente de upload a Open WebUI
+      const uploadResult = await new Promise((resolve, reject) => {
+        const formData = new FormData();
+        formData.append('file', buffer, {
+          filename: filename,
+          contentType: 'application/pdf',
+          knownLength: buffer.length
+        });
+
+        const uploadUrl = new URL(`${OPENWEBUI_URL}/api/v1/files/`);
+        const options = {
+          protocol: uploadUrl.protocol,
+          host: uploadUrl.hostname,
+          port: uploadUrl.port || (uploadUrl.protocol === 'https:' ? 443 : 80),
+          path: uploadUrl.pathname,
+          method: 'POST',
+          headers: {
+            'Authorization': `Bearer ${apiKey}`,
+            ...formData.getHeaders()
+          }
+        };
+
+        const httpModule = uploadUrl.protocol === 'https:' ? require('https') : require('http');
+
+        const req = httpModule.request(options, (response) => {
+          let data = '';
+          response.on('data', chunk => data += chunk);
+          response.on('end', () => {
+            if (response.statusCode >= 200 && response.statusCode < 300) {
+              try {
+                resolve(JSON.parse(data));
+              } catch (e) {
+                reject(new Error(`Error parseando respuesta: ${data}`));
+              }
+            } else {
+              reject(new Error(`Error subiendo: ${response.statusCode} - ${data}`));
+            }
+          });
+        });
+
+        req.on('error', (error) => {
+          reject(new Error(`Error de conexión: ${error.message}`));
+        });
+
+        formData.pipe(req);
+      });
+
+      // Agregar a Knowledge Base si se especificó
+      let knowledgeResult = null;
+      if (kbId) {
+        const addToKbResponse = await fetch(`${OPENWEBUI_URL}/api/v1/knowledge/${kbId}/file/add`, {
+          method: 'POST',
+          headers: {
+            'Authorization': `Bearer ${apiKey}`,
+            'Content-Type': 'application/json'
+          },
+          body: JSON.stringify({ file_id: uploadResult.id })
+        });
+
+        if (addToKbResponse.ok) {
+          knowledgeResult = await addToKbResponse.json();
+        }
+      }
+
+      return res.json({
+        success: true,
+        filename: filename,
+        type: extraction.type,
+        text: null,
+        message: 'PDF subido a Open WebUI para procesamiento',
+        uploadedToRag: true,
+        fileId: uploadResult.id,
+        knowledgeBase: knowledgeResult
+      });
+    }
+
+    // Subir a RAG si se solicita y hay texto extraído
+    let ragResult = null;
+    if (uploadToRag && apiKey && extraction.text) {
+      console.log(`[Upload] Subiendo texto extraído a RAG...`);
+
+      // Crear archivo de texto con el contenido extraído
+      const textBuffer = Buffer.from(extraction.text, 'utf-8');
+      const textFilename = filename.replace(/\.[^.]+$/, '.txt');
+
+      const uploadResult = await new Promise((resolve, reject) => {
+        const formData = new FormData();
+        formData.append('file', textBuffer, {
+          filename: textFilename,
+          contentType: 'text/plain',
+          knownLength: textBuffer.length
+        });
+
+        const uploadUrl = new URL(`${OPENWEBUI_URL}/api/v1/files/`);
+        const options = {
+          protocol: uploadUrl.protocol,
+          host: uploadUrl.hostname,
+          port: uploadUrl.port || (uploadUrl.protocol === 'https:' ? 443 : 80),
+          path: uploadUrl.pathname,
+          method: 'POST',
+          headers: {
+            'Authorization': `Bearer ${apiKey}`,
+            ...formData.getHeaders()
+          }
+        };
+
+        const httpModule = uploadUrl.protocol === 'https:' ? require('https') : require('http');
+
+        const req = httpModule.request(options, (response) => {
+          let data = '';
+          response.on('data', chunk => data += chunk);
+          response.on('end', () => {
+            if (response.statusCode >= 200 && response.statusCode < 300) {
+              try {
+                resolve(JSON.parse(data));
+              } catch (e) {
+                reject(new Error(`Error parseando respuesta: ${data}`));
+              }
+            } else {
+              reject(new Error(`Error subiendo: ${response.statusCode} - ${data}`));
+            }
+          });
+        });
+
+        req.on('error', (error) => {
+          reject(new Error(`Error de conexión: ${error.message}`));
+        });
+
+        formData.pipe(req);
+      });
+
+      ragResult = { fileId: uploadResult.id, filename: textFilename };
+
+      // Agregar a Knowledge Base si se especificó
+      if (kbId) {
+        const addToKbResponse = await fetch(`${OPENWEBUI_URL}/api/v1/knowledge/${kbId}/file/add`, {
+          method: 'POST',
+          headers: {
+            'Authorization': `Bearer ${apiKey}`,
+            'Content-Type': 'application/json'
+          },
+          body: JSON.stringify({ file_id: uploadResult.id })
+        });
+
+        if (addToKbResponse.ok) {
+          ragResult.knowledgeBase = await addToKbResponse.json();
+        }
+      }
+    }
+
+    console.log(`[Upload] Procesamiento exitoso: ${extraction.type}, ${extraction.text?.length || 0} caracteres`);
+
+    res.json({
+      success: true,
+      filename: filename,
+      type: extraction.type,
+      text: extraction.text,
+      textLength: extraction.text?.length || 0,
+      sheets: extraction.sheets || null,
+      sheetNames: extraction.sheetNames || null,
+      uploadedToRag: !!ragResult,
+      ragResult: ragResult
+    });
+
+  } catch (error) {
+    console.error('[Upload] Error:', error.message);
+    res.status(500).json({
+      success: false,
+      error: 'Error procesando archivo',
+      message: error.message
+    });
+  }
+});
 
 /**
  * Helper: Espera a que el archivo esté procesado
