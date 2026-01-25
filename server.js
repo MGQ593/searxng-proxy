@@ -147,7 +147,9 @@ const OPENWEBUI_MODEL = process.env.OPENWEBUI_MODEL || ''; // Modelo a usar (vac
 
 // Habilitar CORS para todas las peticiones
 app.use(cors());
-app.use(express.json());
+// Aumentar límite de JSON para soportar archivos base64 (50MB)
+app.use(express.json({ limit: '50mb' }));
+app.use(express.urlencoded({ limit: '50mb', extended: true }));
 
 // Health check
 app.get('/health', (req, res) => {
