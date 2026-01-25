@@ -1,7 +1,16 @@
 /**
  * SearXNG Proxy Server
- * Version: 1.2.3
+ * Version: 1.2.5
  * Last Update: 2026-01-25
+ *
+ * Cambios v1.2.5:
+ * - Nuevo endpoint /retrieve-only para obtener fragmentos sin generación
+ * - Permite usar RAG sin necesidad de modelo configurado en Open WebUI
+ * - Los fragmentos se pasan al modelo principal (Azure OpenAI) del add-in
+ *
+ * Cambios v1.2.4:
+ * - Modelo RAG configurable via OPENWEBUI_MODEL
+ * - Si no se especifica modelo, Open WebUI usa el default del servidor
  *
  * Cambios v1.2.3:
  * - Corregido upload a Open WebUI: usar http/https nativo con form-data.pipe()
@@ -34,8 +43,8 @@ const cors = require('cors');
 const cheerio = require('cheerio');
 const FormData = require('form-data');
 
-const VERSION = '1.2.3';
-const BUILD_DATE = '2026-01-25T21:00:00Z';
+const VERSION = '1.2.5';
+const BUILD_DATE = '2026-01-25T23:30:00Z';
 
 // Puppeteer es opcional - cargarlo dinámicamente solo cuando se necesite
 let puppeteer = null;
@@ -62,6 +71,7 @@ const SEARXNG_URL = process.env.SEARXNG_URL || 'https://automatizacion-searxng.0
 const OPENWEBUI_URL = process.env.OPENWEBUI_URL || 'https://sigai.planautomotor.com.ec';
 const OPENWEBUI_API_KEY = process.env.OPENWEBUI_API_KEY || ''; // Clave API de Open WebUI
 const OPENWEBUI_KNOWLEDGE_ID = process.env.OPENWEBUI_KNOWLEDGE_ID || ''; // ID de la Knowledge Base "EvoX_DocProxy"
+const OPENWEBUI_MODEL = process.env.OPENWEBUI_MODEL || ''; // Modelo a usar (vacío = usar modelo por defecto del servidor)
 
 // Habilitar CORS para todas las peticiones
 app.use(cors());
@@ -789,8 +799,9 @@ app.post('/query-rag', async (req, res) => {
     console.log(`[RAG] Consultando: ${query}`);
 
     // Construir request body
+    // Usar el modelo especificado, o el configurado en env, o dejar que Open WebUI use el default
+    const modelToUse = model || OPENWEBUI_MODEL;
     const requestBody = {
-      model: model || 'llama3.2:latest',
       messages: [
         {
           role: 'user',
@@ -799,6 +810,11 @@ app.post('/query-rag', async (req, res) => {
       ],
       stream: false
     };
+
+    // Solo incluir model si hay uno especificado
+    if (modelToUse) {
+      requestBody.model = modelToUse;
+    }
 
     // Si hay Knowledge Base, usar como collection
     if (kbId) {
@@ -838,6 +854,135 @@ app.post('/query-rag', async (req, res) => {
     console.error('[RAG] Query error:', error.message);
     res.status(500).json({
       error: 'Error consultando RAG',
+      message: error.message
+    });
+  }
+});
+
+/**
+ * Retrieval-only: Obtiene fragmentos relevantes sin generación
+ * POST /retrieve-only
+ * Body: { query: string, knowledgeId?: string, topK?: number }
+ *
+ * Esto permite usar RAG sin necesidad de tener un modelo configurado en Open WebUI.
+ * Los fragmentos retornados pueden pasarse al modelo principal del add-in (Azure OpenAI).
+ */
+app.post('/retrieve-only', async (req, res) => {
+  try {
+    const { query, knowledgeId, topK = 8 } = req.body;
+    const apiKey = getApiKey(req.body.apiKey);
+    const kbId = knowledgeId || OPENWEBUI_KNOWLEDGE_ID;
+
+    if (!query) {
+      return res.status(400).json({ error: 'query is required' });
+    }
+
+    if (!apiKey) {
+      return res.status(400).json({ error: 'API Key not configured' });
+    }
+
+    if (!kbId) {
+      return res.status(400).json({ error: 'Knowledge Base ID not configured' });
+    }
+
+    console.log(`[RAG] Retrieval-only para: "${query}" (top ${topK})`);
+
+    // Usar el endpoint de retrieval de Open WebUI
+    // POST /api/v1/retrieval/query
+    const retrievalResponse = await fetch(`${OPENWEBUI_URL}/api/v1/retrieval/query`, {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${apiKey}`,
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify({
+        collection_names: [kbId],
+        query: query,
+        k: topK
+      })
+    });
+
+    if (!retrievalResponse.ok) {
+      // Si falla el endpoint de retrieval, intentar método alternativo
+      console.log(`[RAG] Endpoint /api/v1/retrieval/query no disponible, intentando alternativa...`);
+
+      // Método alternativo: obtener los archivos de la KB y buscar en ellos
+      const kbResponse = await fetch(`${OPENWEBUI_URL}/api/v1/knowledge/${kbId}`, {
+        headers: { 'Authorization': `Bearer ${apiKey}` }
+      });
+
+      if (!kbResponse.ok) {
+        throw new Error(`Error obteniendo Knowledge Base: ${kbResponse.status}`);
+      }
+
+      const kbData = await kbResponse.json();
+
+      // Obtener contenido de los archivos
+      const chunks = [];
+      if (kbData.files && kbData.files.length > 0) {
+        for (const file of kbData.files.slice(0, 5)) { // Limitar a 5 archivos
+          try {
+            const fileResponse = await fetch(`${OPENWEBUI_URL}/api/v1/files/${file.id}`, {
+              headers: { 'Authorization': `Bearer ${apiKey}` }
+            });
+
+            if (fileResponse.ok) {
+              const fileData = await fileResponse.json();
+              if (fileData.data && fileData.data.content) {
+                // Agregar fragmento con metadatos
+                chunks.push({
+                  content: fileData.data.content.substring(0, 2000), // Limitar tamaño
+                  filename: fileData.filename || file.filename || 'unknown',
+                  fileId: file.id,
+                  source: 'file_content'
+                });
+              }
+            }
+          } catch (err) {
+            console.warn(`[RAG] Error obteniendo archivo ${file.id}:`, err.message);
+          }
+        }
+      }
+
+      console.log(`[RAG] Método alternativo: ${chunks.length} fragmentos de archivos`);
+
+      return res.json({
+        success: true,
+        method: 'file_content',
+        query: query,
+        chunks: chunks,
+        knowledgeBaseId: kbId,
+        knowledgeBaseName: kbData.name || kbId
+      });
+    }
+
+    // Procesar respuesta del endpoint de retrieval
+    const retrievalData = await retrievalResponse.json();
+    console.log(`[RAG] Retrieval exitoso: ${retrievalData.documents?.length || retrievalData.results?.length || 0} documentos`);
+
+    // Normalizar la respuesta
+    const documents = retrievalData.documents || retrievalData.results || [];
+    const chunks = documents.map((doc, index) => ({
+      content: typeof doc === 'string' ? doc : (doc.content || doc.text || doc.page_content || JSON.stringify(doc)),
+      metadata: typeof doc === 'object' ? (doc.metadata || {}) : {},
+      score: doc.score || doc.distance || null,
+      source: 'vector_search',
+      index: index
+    }));
+
+    res.json({
+      success: true,
+      method: 'vector_retrieval',
+      query: query,
+      chunks: chunks,
+      knowledgeBaseId: kbId,
+      totalChunks: chunks.length
+    });
+
+  } catch (error) {
+    console.error('[RAG] Retrieve-only error:', error.message);
+    res.status(500).json({
+      error: 'Error en retrieval',
       message: error.message
     });
   }
