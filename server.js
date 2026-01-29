@@ -1,7 +1,23 @@
 /**
  * SearXNG Proxy Server
- * Version: 1.3.0
- * Last Update: 2026-01-26
+ * Version: 1.5.0
+ * Last Update: 2026-01-28
+ *
+ * Cambios v1.5.0 (Deep Search):
+ * - Nuevo endpoint /deep-search para búsqueda profunda con crawling
+ * - Visita múltiples páginas de resultados y extrae contenido completo
+ * - Sigue enlaces internos relevantes para mayor profundidad
+ * - Consolidación inteligente de información de múltiples fuentes
+ *
+ * Cambios v1.4.0 (Seguridad):
+ * - ELIMINADOS endpoints de debug (/info, /debug-rag, /rag-config) por seguridad
+ * - Toda información de diagnóstico ahora se muestra en logs de consola del servidor
+ * - Reducida superficie de ataque eliminando endpoints que exponían configuración
+ *
+ * Cambios v1.3.1:
+ * - Fix: Esperar procesamiento asíncrono de archivos antes de agregar a Knowledge Base
+ * - Previene error 400 "The content provided is empty" en Open WebUI
+ * - Polling de estado de archivo hasta que esté procesado (máx 60 segundos)
  *
  * Cambios v1.3.0:
  * - Nuevo endpoint /upload-file para múltiples formatos (PDF, DOCX, XLSX, CSV, TXT)
@@ -13,7 +29,6 @@
  * - Mejor manejo de archivos subidos que no se asociaron a la KB
  *
  * Cambios v1.2.6:
- * - Nuevo endpoint /debug-rag para diagnosticar contenido de Knowledge Base
  * - Mejorado /retrieve-only con múltiples estrategias de retrieval
  * - Soporte para diferentes formatos de collection_names en Open WebUI
  *
@@ -30,9 +45,6 @@
  * - Corregido upload a Open WebUI: usar http/https nativo con form-data.pipe()
  * - fetch nativo de Node.js no maneja bien FormData multipart
  *
- * Cambios v1.2.2:
- * - Intento fallido con stream + knownLength (fetch no lo soporta bien)
- *
  * Cambios v1.2.1:
  * - Mejorada descarga de PDFs: sigue redirecciones y extrae URL real de páginas intermedias
  * - Verifica Content-Type y header PDF válido
@@ -42,12 +54,8 @@
  * - Mejorada detección de PDFs: ahora detecta enlaces dinámicos (sdm_process_download, etc.)
  * - Detecta PDFs por texto del enlace (descargar, boletín, informe)
  *
- * Cambios v1.1.1:
- * - /info ahora requiere token (INFO_TOKEN) para acceso
- *
  * Cambios v1.1.0:
  * - Puppeteer ahora es opcional (carga dinámica)
- * - Agregado endpoint /info para debugging
  * - Mejor manejo de errores y SIGTERM
  * - Integración con Open WebUI RAG
  */
@@ -57,12 +65,12 @@ const cors = require('cors');
 const cheerio = require('cheerio');
 const FormData = require('form-data');
 
-const VERSION = '1.3.0';
-const BUILD_DATE = '2026-01-26T02:00:00Z';
+const VERSION = '1.5.0';
+const BUILD_DATE = '2026-01-28T10:00:00Z';
 
 // Document processing libraries (optional, load dynamically)
 let mammoth = null;
-let XLSX = null;
+let ExcelJS = null;
 
 async function getMammoth() {
   if (!mammoth) {
@@ -77,17 +85,17 @@ async function getMammoth() {
   return mammoth;
 }
 
-async function getXLSX() {
-  if (!XLSX) {
+async function getExcelJS() {
+  if (!ExcelJS) {
     try {
-      XLSX = require('xlsx');
-      console.log('[XLSX] Loaded successfully');
+      ExcelJS = require('exceljs');
+      console.log('[ExcelJS] Loaded successfully');
     } catch (error) {
-      console.warn('[XLSX] Not available:', error.message);
+      console.warn('[ExcelJS] Not available:', error.message);
       return null;
     }
   }
-  return XLSX;
+  return ExcelJS;
 }
 
 // Puppeteer es opcional - cargarlo dinámicamente solo cuando se necesite
@@ -156,42 +164,8 @@ app.get('/health', (req, res) => {
   res.json({ status: 'ok', timestamp: new Date().toISOString() });
 });
 
-// Info endpoint for debugging - PROTEGIDO CON TOKEN
-// Usar: /info?token=TU_TOKEN o configurar INFO_TOKEN en variables de entorno
-const INFO_TOKEN = process.env.INFO_TOKEN || '';
-
-app.get('/info', async (req, res) => {
-  // Si hay token configurado, requerir autenticación
-  if (INFO_TOKEN && req.query.token !== INFO_TOKEN) {
-    return res.status(401).json({ error: 'Unauthorized', hint: 'Add ?token=YOUR_TOKEN' });
-  }
-
-  const pup = await getPuppeteer();
-  res.json({
-    status: 'ok',
-    version: VERSION,
-    buildDate: BUILD_DATE,
-    timestamp: new Date().toISOString(),
-    config: {
-      searxngUrl: SEARXNG_URL,
-      openwebuiUrl: OPENWEBUI_URL,
-      apiKeyConfigured: !!OPENWEBUI_API_KEY,
-      knowledgeIdConfigured: !!OPENWEBUI_KNOWLEDGE_ID
-    },
-    capabilities: {
-      search: true,
-      fetch: true,
-      fetchJs: !!pup,
-      rag: !!OPENWEBUI_API_KEY
-    },
-    memory: {
-      heapUsed: Math.round(process.memoryUsage().heapUsed / 1024 / 1024) + 'MB',
-      heapTotal: Math.round(process.memoryUsage().heapTotal / 1024 / 1024) + 'MB',
-      rss: Math.round(process.memoryUsage().rss / 1024 / 1024) + 'MB'
-    },
-    uptime: Math.round(process.uptime()) + ' seconds'
-  });
-});
+// NOTA: Endpoints de debug (/info, /debug-rag, /rag-config) fueron eliminados por seguridad
+// Para debugging, usar los logs de consola del servidor
 
 // Proxy de búsqueda
 app.get('/search', async (req, res) => {
@@ -442,7 +416,7 @@ app.get('/fetch-js', async (req, res) => {
     // Iniciar browser con configuración para Docker/Windows
     const launchOptions = {
       executablePath: chromePath,
-      headless: 'new',
+      headless: true,
       args: [
         '--no-sandbox',
         '--disable-setuid-sandbox',
@@ -613,6 +587,282 @@ app.get('/fetch-js', async (req, res) => {
   }
 });
 
+// ===== Deep Search - Búsqueda profunda con crawling =====
+
+/**
+ * Helper: Extrae contenido de una URL de forma simplificada
+ */
+async function extractPageContent(url, timeout = 15000) {
+  try {
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), timeout);
+
+    const response = await fetch(url, {
+      method: 'GET',
+      headers: {
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        'Accept-Language': 'es-ES,es;q=0.9,en;q=0.8'
+      },
+      signal: controller.signal
+    });
+
+    clearTimeout(timeoutId);
+
+    if (!response.ok) {
+      return { success: false, error: `HTTP ${response.status}` };
+    }
+
+    const contentType = response.headers.get('content-type') || '';
+    if (!contentType.includes('text/html') && !contentType.includes('application/xhtml')) {
+      return { success: false, error: 'Not HTML content' };
+    }
+
+    const html = await response.text();
+    const $ = cheerio.load(html);
+
+    // Remover elementos no deseados
+    $('script, style, nav, footer, header, aside, iframe, noscript, .advertisement, .ad, .sidebar, .menu, .navigation').remove();
+
+    // Extraer título
+    const title = $('title').text().trim() || $('h1').first().text().trim();
+
+    // Extraer contenido principal - priorizar article, main, o contenido principal
+    let mainContent = '';
+    const mainSelectors = ['article', 'main', '.content', '.post-content', '.entry-content', '#content', '.article-body'];
+
+    for (const selector of mainSelectors) {
+      const content = $(selector).text().trim();
+      if (content && content.length > mainContent.length) {
+        mainContent = content;
+      }
+    }
+
+    // Si no encontró contenido principal, usar body
+    if (!mainContent || mainContent.length < 200) {
+      mainContent = $('body').text().trim();
+    }
+
+    // Limpiar espacios múltiples y líneas vacías
+    mainContent = mainContent.replace(/\s+/g, ' ').trim();
+
+    // Extraer párrafos relevantes
+    const paragraphs = [];
+    $('p').each((_, el) => {
+      const text = $(el).text().trim();
+      if (text && text.length > 50 && text.length < 2000) {
+        paragraphs.push(text);
+      }
+    });
+
+    // Extraer enlaces internos relevantes (para seguir crawleando)
+    const internalLinks = [];
+    const baseUrl = new URL(url);
+
+    $('a[href]').each((i, a) => {
+      const href = $(a).attr('href');
+      if (!href) return;
+
+      try {
+        const linkUrl = new URL(href, url);
+        // Solo enlaces del mismo dominio
+        if (linkUrl.hostname === baseUrl.hostname) {
+          const linkText = $(a).text().trim();
+          if (linkText && linkText.length > 5 && linkText.length < 100) {
+            // Evitar enlaces de navegación comunes
+            const skipPatterns = /login|logout|register|signup|cart|checkout|search|contact|about|privacy|terms|cookie/i;
+            if (!skipPatterns.test(linkUrl.pathname) && !skipPatterns.test(linkText)) {
+              internalLinks.push({
+                url: linkUrl.href,
+                text: linkText
+              });
+            }
+          }
+        }
+      } catch (e) {
+        // URL inválida, ignorar
+      }
+    });
+
+    return {
+      success: true,
+      url,
+      title,
+      content: mainContent.substring(0, 8000), // Limitar contenido
+      paragraphs: paragraphs.slice(0, 10),
+      internalLinks: internalLinks.slice(0, 10),
+      contentLength: mainContent.length
+    };
+
+  } catch (error) {
+    return {
+      success: false,
+      url,
+      error: error.name === 'AbortError' ? 'Timeout' : error.message
+    };
+  }
+}
+
+/**
+ * Deep Search - Búsqueda profunda con crawling de múltiples páginas
+ * POST /deep-search
+ * Body: {
+ *   query: string,           // Consulta de búsqueda
+ *   maxResults?: number,     // Máximo resultados de búsqueda a visitar (default: 5)
+ *   maxDepth?: number,       // Profundidad de crawling (0=solo resultados, 1=seguir 1 nivel de links)
+ *   maxPagesPerSite?: number,// Máximo páginas por sitio (default: 3)
+ *   language?: string        // Idioma de búsqueda (default: 'es')
+ * }
+ */
+app.post('/deep-search', async (req, res) => {
+  try {
+    const {
+      query,
+      maxResults = 5,
+      maxDepth = 1,
+      maxPagesPerSite = 3,
+      language = 'es'
+    } = req.body;
+
+    if (!query) {
+      return res.status(400).json({ error: 'query is required' });
+    }
+
+    console.log(`[DeepSearch] Iniciando búsqueda profunda: "${query}"`);
+    console.log(`[DeepSearch] Config: maxResults=${maxResults}, maxDepth=${maxDepth}, maxPagesPerSite=${maxPagesPerSite}`);
+
+    const startTime = Date.now();
+
+    // 1. Realizar búsqueda en SearXNG
+    const searchParams = new URLSearchParams({
+      q: query,
+      format: 'json',
+      language: language,
+      safesearch: '1',
+      categories: 'general'
+    });
+
+    const searchResponse = await fetch(`${SEARXNG_URL}/search?${searchParams.toString()}`, {
+      method: 'GET',
+      headers: {
+        'Accept': 'application/json',
+        'User-Agent': 'SearXNG-Proxy/1.0'
+      }
+    });
+
+    if (!searchResponse.ok) {
+      throw new Error(`Error en búsqueda SearXNG: ${searchResponse.status}`);
+    }
+
+    const searchData = await searchResponse.json();
+    const searchResults = (searchData.results || []).slice(0, maxResults);
+
+    console.log(`[DeepSearch] ${searchResults.length} resultados de búsqueda encontrados`);
+
+    // 2. Visitar cada resultado y extraer contenido
+    const visitedUrls = new Set();
+    const allContent = [];
+    const errors = [];
+
+    for (const result of searchResults) {
+      if (visitedUrls.has(result.url)) continue;
+      visitedUrls.add(result.url);
+
+      console.log(`[DeepSearch] Visitando: ${result.url}`);
+
+      const pageContent = await extractPageContent(result.url);
+
+      if (pageContent.success) {
+        allContent.push({
+          url: result.url,
+          title: pageContent.title || result.title,
+          snippet: result.content,
+          fullContent: pageContent.content,
+          paragraphs: pageContent.paragraphs,
+          source: result.engine,
+          depth: 0
+        });
+
+        // 3. Si maxDepth > 0, seguir enlaces internos relevantes
+        if (maxDepth > 0 && pageContent.internalLinks) {
+          const sitePagesVisited = 1;
+
+          for (const link of pageContent.internalLinks) {
+            if (sitePagesVisited >= maxPagesPerSite) break;
+            if (visitedUrls.has(link.url)) continue;
+
+            // Solo seguir si el texto del enlace parece relevante a la query
+            const queryWords = query.toLowerCase().split(/\s+/);
+            const linkTextLower = link.text.toLowerCase();
+            const isRelevant = queryWords.some(word =>
+              word.length > 3 && linkTextLower.includes(word)
+            );
+
+            if (isRelevant) {
+              visitedUrls.add(link.url);
+              console.log(`[DeepSearch] Siguiendo enlace: ${link.url}`);
+
+              const subPageContent = await extractPageContent(link.url);
+
+              if (subPageContent.success) {
+                allContent.push({
+                  url: link.url,
+                  title: subPageContent.title,
+                  linkText: link.text,
+                  fullContent: subPageContent.content,
+                  paragraphs: subPageContent.paragraphs,
+                  parentUrl: result.url,
+                  depth: 1
+                });
+              }
+            }
+          }
+        }
+      } else {
+        errors.push({
+          url: result.url,
+          error: pageContent.error
+        });
+      }
+    }
+
+    const elapsedTime = Date.now() - startTime;
+    console.log(`[DeepSearch] Completado: ${allContent.length} páginas extraídas en ${elapsedTime}ms`);
+
+    // 4. Consolidar información para el AI
+    let consolidatedText = `## Resultados de búsqueda profunda para: "${query}"\n\n`;
+    consolidatedText += `Fuentes consultadas: ${allContent.length} páginas\n\n`;
+
+    allContent.forEach((page, index) => {
+      consolidatedText += `### ${index + 1}. ${page.title}\n`;
+      consolidatedText += `**URL:** ${page.url}\n`;
+      if (page.source) {
+        consolidatedText += `**Fuente:** ${page.source}\n`;
+      }
+      consolidatedText += `\n${page.fullContent.substring(0, 2000)}${page.fullContent.length > 2000 ? '...' : ''}\n\n`;
+    });
+
+    res.json({
+      success: true,
+      query,
+      totalPagesVisited: visitedUrls.size,
+      totalContentExtracted: allContent.length,
+      elapsedTimeMs: elapsedTime,
+      pages: allContent,
+      consolidatedText: consolidatedText.substring(0, 30000), // Limitar para no exceder contexto
+      errors: errors.length > 0 ? errors : undefined,
+      searchSuggestions: searchData.suggestions || []
+    });
+
+  } catch (error) {
+    console.error('[DeepSearch] Error:', error.message);
+    res.status(500).json({
+      error: 'Error en búsqueda profunda',
+      message: error.message
+    });
+  }
+});
+
 // ===== Open WebUI RAG Integration =====
 
 /**
@@ -671,33 +921,47 @@ async function extractTextFromFile(buffer, filename, mimeType) {
     }
   }
 
-  // XLSX/XLS - usar xlsx
+  // XLSX/XLS - usar exceljs
   if (ext === 'xlsx' || ext === 'xls' ||
       mimeType === 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' ||
       mimeType === 'application/vnd.ms-excel') {
-    const xlsxLib = await getXLSX();
-    if (!xlsxLib) {
-      return { success: false, error: 'xlsx library not installed. Run: npm install xlsx' };
+    const exceljs = await getExcelJS();
+    if (!exceljs) {
+      return { success: false, error: 'exceljs library not installed. Run: npm install exceljs' };
     }
 
     try {
-      const workbook = xlsxLib.read(buffer, { type: 'buffer' });
+      const workbook = new exceljs.Workbook();
+      await workbook.xlsx.load(buffer);
+
       const sheets = {};
+      const sheetNames = [];
       let allText = [];
 
-      for (const sheetName of workbook.SheetNames) {
-        const sheet = workbook.Sheets[sheetName];
+      workbook.eachSheet((worksheet) => {
+        const sheetName = worksheet.name;
+        sheetNames.push(sheetName);
+
         // Convertir a CSV para texto legible
-        const csv = xlsxLib.utils.sheet_to_csv(sheet);
+        const rows = [];
+        worksheet.eachRow((row) => {
+          const values = [];
+          row.eachCell({ includeEmpty: true }, (cell) => {
+            values.push(cell.text || '');
+          });
+          rows.push(values.join(','));
+        });
+
+        const csv = rows.join('\n');
         sheets[sheetName] = csv;
         allText.push(`=== Hoja: ${sheetName} ===\n${csv}`);
-      }
+      });
 
       return {
         success: true,
         text: allText.join('\n\n'),
         sheets: sheets,
-        sheetNames: workbook.SheetNames,
+        sheetNames: sheetNames,
         type: 'xlsx'
       };
     } catch (error) {
@@ -835,6 +1099,14 @@ app.post('/upload-file', async (req, res) => {
         formData.pipe(req);
       });
 
+      // Esperar a que el archivo sea procesado antes de agregar a KB
+      console.log(`[Upload] Esperando procesamiento del archivo...`);
+      const isProcessed = await waitForFileProcessing(uploadResult.id, apiKey);
+
+      if (!isProcessed) {
+        console.warn(`[Upload] El archivo puede no estar completamente procesado`);
+      }
+
       // Agregar a Knowledge Base si se especificó
       let knowledgeResult = null;
       if (kbId) {
@@ -849,6 +1121,9 @@ app.post('/upload-file', async (req, res) => {
 
         if (addToKbResponse.ok) {
           knowledgeResult = await addToKbResponse.json();
+        } else {
+          const kbError = await addToKbResponse.text();
+          console.warn(`[Upload] No se pudo agregar a KB: ${kbError}`);
         }
       }
 
@@ -921,6 +1196,14 @@ app.post('/upload-file', async (req, res) => {
 
       ragResult = { fileId: uploadResult.id, filename: textFilename };
 
+      // Esperar a que el archivo sea procesado antes de agregar a KB
+      console.log(`[Upload] Esperando procesamiento del texto extraído...`);
+      const isProcessed = await waitForFileProcessing(uploadResult.id, apiKey);
+
+      if (!isProcessed) {
+        console.warn(`[Upload] El archivo de texto puede no estar completamente procesado`);
+      }
+
       // Agregar a Knowledge Base si se especificó
       if (kbId) {
         const addToKbResponse = await fetch(`${OPENWEBUI_URL}/api/v1/knowledge/${kbId}/file/add`, {
@@ -934,6 +1217,9 @@ app.post('/upload-file', async (req, res) => {
 
         if (addToKbResponse.ok) {
           ragResult.knowledgeBase = await addToKbResponse.json();
+        } else {
+          const kbError = await addToKbResponse.text();
+          console.warn(`[Upload] No se pudo agregar texto a KB: ${kbError}`);
         }
       }
     }
@@ -1281,206 +1567,6 @@ app.post('/query-rag', async (req, res) => {
   }
 });
 
-/**
- * Debug RAG: Muestra información detallada de la Knowledge Base
- * GET /debug-rag
- */
-app.get('/debug-rag', async (req, res) => {
-  try {
-    const apiKey = getApiKey(req.query.apiKey);
-    const kbId = req.query.knowledgeId || OPENWEBUI_KNOWLEDGE_ID;
-
-    if (!apiKey) {
-      return res.status(400).json({ error: 'API Key not configured' });
-    }
-
-    if (!kbId) {
-      return res.status(400).json({ error: 'Knowledge Base ID not configured' });
-    }
-
-    console.log(`[DEBUG-RAG] Diagnosticando KB: ${kbId}`);
-
-    const debug = {
-      knowledgeBaseId: kbId,
-      openwebuiUrl: OPENWEBUI_URL,
-      checks: {}
-    };
-
-    // 1. Obtener info de la Knowledge Base
-    try {
-      const kbResponse = await fetch(`${OPENWEBUI_URL}/api/v1/knowledge/${kbId}`, {
-        headers: { 'Authorization': `Bearer ${apiKey}` }
-      });
-
-      if (kbResponse.ok) {
-        const kbData = await kbResponse.json();
-        debug.checks.knowledgeBase = {
-          status: 'ok',
-          name: kbData.name,
-          description: kbData.description,
-          filesCount: kbData.files?.length || 0,
-          files: (kbData.files || []).map(f => ({
-            id: f.id,
-            filename: f.filename || f.meta?.name,
-            size: f.meta?.size,
-            contentType: f.meta?.content_type
-          })),
-          data: kbData.data || null
-        };
-      } else {
-        debug.checks.knowledgeBase = {
-          status: 'error',
-          statusCode: kbResponse.status,
-          error: await kbResponse.text()
-        };
-      }
-    } catch (err) {
-      debug.checks.knowledgeBase = { status: 'error', error: err.message };
-    }
-
-    // 2. Probar endpoint de retrieval con diferentes formatos
-    const testQuery = 'test';
-    const collectionFormats = [
-      kbId,                          // ID directo
-      `knowledge_${kbId}`,           // Con prefijo knowledge_
-      `kb_${kbId}`,                  // Con prefijo kb_
-    ];
-
-    debug.checks.retrievalTests = [];
-
-    for (const collectionName of collectionFormats) {
-      try {
-        const retrievalResponse = await fetch(`${OPENWEBUI_URL}/api/v1/retrieval/query`, {
-          method: 'POST',
-          headers: {
-            'Authorization': `Bearer ${apiKey}`,
-            'Content-Type': 'application/json'
-          },
-          body: JSON.stringify({
-            collection_names: [collectionName],
-            query: testQuery,
-            k: 3
-          })
-        });
-
-        const retrievalData = retrievalResponse.ok ? await retrievalResponse.json() : await retrievalResponse.text();
-
-        debug.checks.retrievalTests.push({
-          collectionName,
-          status: retrievalResponse.ok ? 'ok' : 'error',
-          statusCode: retrievalResponse.status,
-          documentsCount: retrievalResponse.ok ? (retrievalData.documents?.length || retrievalData.results?.length || 0) : 0,
-          response: retrievalResponse.ok ? retrievalData : retrievalData.substring(0, 200)
-        });
-      } catch (err) {
-        debug.checks.retrievalTests.push({
-          collectionName,
-          status: 'error',
-          error: err.message
-        });
-      }
-    }
-
-    // 3. Obtener contenido de los archivos directamente
-    if (debug.checks.knowledgeBase?.files?.length > 0) {
-      debug.checks.fileContents = [];
-
-      for (const file of debug.checks.knowledgeBase.files.slice(0, 3)) {
-        try {
-          const fileResponse = await fetch(`${OPENWEBUI_URL}/api/v1/files/${file.id}`, {
-            headers: { 'Authorization': `Bearer ${apiKey}` }
-          });
-
-          if (fileResponse.ok) {
-            const fileData = await fileResponse.json();
-            debug.checks.fileContents.push({
-              fileId: file.id,
-              filename: file.filename,
-              hasContent: !!(fileData.data?.content),
-              contentLength: fileData.data?.content?.length || 0,
-              contentPreview: fileData.data?.content?.substring(0, 300) || 'No content'
-            });
-          } else {
-            debug.checks.fileContents.push({
-              fileId: file.id,
-              filename: file.filename,
-              status: 'error',
-              statusCode: fileResponse.status
-            });
-          }
-        } catch (err) {
-          debug.checks.fileContents.push({
-            fileId: file.id,
-            filename: file.filename,
-            status: 'error',
-            error: err.message
-          });
-        }
-      }
-    }
-
-    // 4. Listar TODOS los archivos de Open WebUI (no solo los de la KB)
-    try {
-      const allFilesResponse = await fetch(`${OPENWEBUI_URL}/api/v1/files/`, {
-        headers: { 'Authorization': `Bearer ${apiKey}` }
-      });
-
-      if (allFilesResponse.ok) {
-        const allFiles = await allFilesResponse.json();
-        debug.checks.allOpenWebUIFiles = {
-          status: 'ok',
-          totalCount: allFiles.length,
-          files: allFiles.slice(0, 10).map(f => ({
-            id: f.id,
-            filename: f.filename || f.meta?.name,
-            created_at: f.created_at,
-            size: f.meta?.size,
-            contentType: f.meta?.content_type
-          }))
-        };
-
-        // Obtener contenido del primer archivo si existe
-        if (allFiles.length > 0) {
-          const firstFile = allFiles[0];
-          try {
-            const firstFileResponse = await fetch(`${OPENWEBUI_URL}/api/v1/files/${firstFile.id}`, {
-              headers: { 'Authorization': `Bearer ${apiKey}` }
-            });
-            if (firstFileResponse.ok) {
-              const firstFileData = await firstFileResponse.json();
-              debug.checks.firstFileContent = {
-                fileId: firstFile.id,
-                filename: firstFile.filename || firstFile.meta?.name,
-                hasContent: !!(firstFileData.data?.content),
-                contentLength: firstFileData.data?.content?.length || 0,
-                contentPreview: firstFileData.data?.content?.substring(0, 500) || 'No content'
-              };
-            }
-          } catch (err) {
-            debug.checks.firstFileContent = { status: 'error', error: err.message };
-          }
-        }
-      } else {
-        debug.checks.allOpenWebUIFiles = {
-          status: 'error',
-          statusCode: allFilesResponse.status
-        };
-      }
-    } catch (err) {
-      debug.checks.allOpenWebUIFiles = { status: 'error', error: err.message };
-    }
-
-    console.log(`[DEBUG-RAG] Diagnóstico completado`);
-    res.json(debug);
-
-  } catch (error) {
-    console.error('[DEBUG-RAG] Error:', error.message);
-    res.status(500).json({
-      error: 'Error en diagnóstico RAG',
-      message: error.message
-    });
-  }
-});
 
 /**
  * Retrieval-only: Obtiene fragmentos relevantes sin generación
@@ -1803,18 +1889,6 @@ app.get('/list-rag-files', async (req, res) => {
   }
 });
 
-/**
- * Verifica la configuración de RAG
- * GET /rag-config
- */
-app.get('/rag-config', (req, res) => {
-  res.json({
-    openwebuiUrl: OPENWEBUI_URL,
-    apiKeyConfigured: !!OPENWEBUI_API_KEY,
-    knowledgeIdConfigured: !!OPENWEBUI_KNOWLEDGE_ID,
-    knowledgeId: OPENWEBUI_KNOWLEDGE_ID || null
-  });
-});
 
 // Global error handlers
 process.on('uncaughtException', (error) => {
