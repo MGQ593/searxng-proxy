@@ -1,7 +1,13 @@
 /**
  * SearXNG Proxy Server
- * Version: 1.5.0
- * Last Update: 2026-01-28
+ * Version: 1.6.0
+ * Last Update: 2026-01-31
+ *
+ * Cambios v1.6.0 (Embedded JSON Extraction):
+ * - Nueva función extractEmbeddedJsonData() para extraer datos JSON de scripts
+ * - Detecta arrays de tiendas/ubicaciones, markers de Google Maps, y URLs de API
+ * - Los endpoints /fetch y /fetch-js ahora incluyen campo embeddedData en respuesta
+ * - Útil para páginas de localizadores de tiendas con datos dinámicos
  *
  * Cambios v1.5.0 (Deep Search):
  * - Nuevo endpoint /deep-search para búsqueda profunda con crawling
@@ -65,8 +71,8 @@ const cors = require('cors');
 const cheerio = require('cheerio');
 const FormData = require('form-data');
 
-const VERSION = '1.5.0';
-const BUILD_DATE = '2026-01-28T10:00:00Z';
+const VERSION = '1.6.0';
+const BUILD_DATE = '2026-01-31T21:00:00Z';
 
 // Document processing libraries (optional, load dynamically)
 let mammoth = null;
@@ -211,6 +217,129 @@ app.get('/config', async (req, res) => {
   }
 });
 
+/**
+ * Helper: Extrae datos JSON embebidos en scripts de la página
+ * Busca patrones comunes de datos de tiendas, markers, ubicaciones, etc.
+ */
+function extractEmbeddedJsonData(html) {
+  const extractedData = {
+    stores: [],
+    locations: [],
+    markers: [],
+    jsonObjects: [],
+    apiUrls: []
+  };
+
+  try {
+    const $ = cheerio.load(html);
+
+    // Buscar en todos los scripts
+    $('script').each((i, script) => {
+      const scriptContent = $(script).html() || '';
+      if (!scriptContent || scriptContent.length < 20) return;
+
+      // Patrones comunes de datos de tiendas/ubicaciones
+      const patterns = [
+        // Arrays de objetos con coordenadas
+        /(?:var|let|const|window\.)\s*(\w+)\s*=\s*(\[[\s\S]*?(?:lat|lng|latitude|longitude|address|direccion|ciudad|city|nombre|name|tienda|store|sucursal|local)[\s\S]*?\]);?/gi,
+        // JSON.parse de datos
+        /JSON\.parse\s*\(\s*['"`]([\s\S]*?)['"`]\s*\)/gi,
+        // __INITIAL_STATE__ o similar
+        /window\.__(?:INITIAL_STATE|DATA|PRELOADED_STATE|NUXT)__\s*=\s*(\{[\s\S]*?\});?/gi,
+        // data-* attributes con JSON
+        /data-(?:stores|locations|markers|points)\s*=\s*['"](\[[\s\S]*?\])['"]*/gi,
+      ];
+
+      // Buscar arrays de objetos con estructura de tiendas
+      const storeArrayPattern = /\[\s*\{[^[\]]*(?:lat|lng|latitude|longitude|address|direccion|ciudad|city|nombre|name|tienda|store|sucursal|local)[^[\]]*\}(?:\s*,\s*\{[^[\]]*\})*\s*\]/gi;
+      let match;
+
+      while ((match = storeArrayPattern.exec(scriptContent)) !== null) {
+        try {
+          const parsed = JSON.parse(match[0]);
+          if (Array.isArray(parsed) && parsed.length > 0) {
+            // Verificar que parece datos de tiendas
+            const sample = parsed[0];
+            if (sample && typeof sample === 'object') {
+              const keys = Object.keys(sample).join(' ').toLowerCase();
+              if (keys.match(/lat|lng|address|nombre|name|tienda|store|city|ciudad|direccion/)) {
+                extractedData.stores.push(...parsed);
+              }
+            }
+          }
+        } catch (e) {
+          // JSON inválido, ignorar
+        }
+      }
+
+      // Buscar markers de Google Maps
+      const markerPattern = /(?:new\s+google\.maps\.Marker|markers\.push|addMarker)\s*\(\s*\{([^}]+(?:lat|lng|position)[^}]+)\}/gi;
+      while ((match = markerPattern.exec(scriptContent)) !== null) {
+        try {
+          // Intentar extraer lat/lng
+          const latMatch = match[1].match(/lat[itude]*\s*:\s*([-\d.]+)/i);
+          const lngMatch = match[1].match(/(?:lng|lon|longitude)\s*:\s*([-\d.]+)/i);
+          const titleMatch = match[1].match(/title\s*:\s*['"`]([^'"`]+)['"`]/i);
+
+          if (latMatch && lngMatch) {
+            extractedData.markers.push({
+              lat: parseFloat(latMatch[1]),
+              lng: parseFloat(lngMatch[1]),
+              title: titleMatch ? titleMatch[1] : null
+            });
+          }
+        } catch (e) {
+          // Error extrayendo marker
+        }
+      }
+
+      // Buscar URLs de API que devuelvan JSON
+      const apiUrlPattern = /['"`]((?:https?:)?\/\/[^'"`\s]+(?:api|json|stores|locations|sucursales|tiendas)[^'"`\s]*)['"`]/gi;
+      while ((match = apiUrlPattern.exec(scriptContent)) !== null) {
+        const apiUrl = match[1];
+        if (!extractedData.apiUrls.includes(apiUrl)) {
+          extractedData.apiUrls.push(apiUrl);
+        }
+      }
+    });
+
+    // También buscar en data attributes del HTML
+    $('[data-stores], [data-locations], [data-markers], [data-json]').each((i, el) => {
+      const dataAttrs = ['data-stores', 'data-locations', 'data-markers', 'data-json'];
+      dataAttrs.forEach(attr => {
+        const value = $(el).attr(attr);
+        if (value) {
+          try {
+            const parsed = JSON.parse(value);
+            if (Array.isArray(parsed)) {
+              extractedData.jsonObjects.push(...parsed);
+            } else if (typeof parsed === 'object') {
+              extractedData.jsonObjects.push(parsed);
+            }
+          } catch (e) {
+            // JSON inválido
+          }
+        }
+      });
+    });
+
+  } catch (error) {
+    console.error('[ExtractJSON] Error:', error.message);
+  }
+
+  // Consolidar resultados únicos
+  const hasData = extractedData.stores.length > 0 ||
+                  extractedData.markers.length > 0 ||
+                  extractedData.jsonObjects.length > 0 ||
+                  extractedData.apiUrls.length > 0;
+
+  return {
+    found: hasData,
+    ...extractedData,
+    totalItems: extractedData.stores.length + extractedData.markers.length + extractedData.jsonObjects.length
+  };
+}
+
 // Fetch y parseo de contenido web
 app.get('/fetch', async (req, res) => {
   try {
@@ -244,6 +373,13 @@ app.get('/fetch', async (req, res) => {
     }
 
     const html = await response.text();
+
+    // Extraer datos JSON embebidos ANTES de remover scripts
+    const embeddedData = extractEmbeddedJsonData(html);
+    if (embeddedData.found) {
+      console.log(`[Fetch] Datos embebidos encontrados: ${embeddedData.totalItems} items, ${embeddedData.apiUrls.length} APIs`);
+    }
+
     const $ = cheerio.load(html);
 
     // Remover scripts, styles y elementos no deseados
@@ -366,6 +502,7 @@ app.get('/fetch', async (req, res) => {
       textContent: textContent.slice(0, 50), // Limitar a 50 párrafos
       tables: tables.slice(0, 10), // Limitar a 10 tablas
       downloadLinks: downloadLinks.slice(0, 20), // Limitar a 20 enlaces
+      embeddedData: embeddedData.found ? embeddedData : undefined, // Datos JSON extraídos de scripts
       fetchedAt: new Date().toISOString()
     });
 
@@ -453,6 +590,12 @@ app.get('/fetch-js', async (req, res) => {
 
     await browser.close();
     browser = null;
+
+    // Extraer datos JSON embebidos ANTES de remover scripts
+    const embeddedData = extractEmbeddedJsonData(html);
+    if (embeddedData.found) {
+      console.log(`[FetchJS] Datos embebidos encontrados: ${embeddedData.totalItems} items, ${embeddedData.apiUrls.length} APIs`);
+    }
 
     // Parsear con cheerio
     const $ = cheerio.load(html);
@@ -571,6 +714,7 @@ app.get('/fetch-js', async (req, res) => {
       textContent: textContent.slice(0, 50),
       tables: tables.slice(0, 10),
       downloadLinks: downloadLinks.slice(0, 20),
+      embeddedData: embeddedData.found ? embeddedData : undefined, // Datos JSON extraídos de scripts
       fetchedAt: new Date().toISOString(),
       renderedWith: 'puppeteer'
     });
