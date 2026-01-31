@@ -1,7 +1,12 @@
 /**
  * SearXNG Proxy Server
- * Version: 1.6.0
+ * Version: 1.6.1
  * Last Update: 2026-01-31
+ *
+ * Cambios v1.6.1 (API Call Interception):
+ * - /fetch-js ahora captura llamadas API JSON durante la carga de la página
+ * - Nuevo campo apiCalls en respuesta con URLs de API y preview de datos
+ * - Útil para descubrir endpoints de datos dinámicos
  *
  * Cambios v1.6.0 (Embedded JSON Extraction):
  * - Nueva función extractEmbeddedJsonData() para extraer datos JSON de scripts
@@ -71,8 +76,8 @@ const cors = require('cors');
 const cheerio = require('cheerio');
 const FormData = require('form-data');
 
-const VERSION = '1.6.0';
-const BUILD_DATE = '2026-01-31T21:00:00Z';
+const VERSION = '1.6.1';
+const BUILD_DATE = '2026-01-31T21:05:00Z';
 
 // Document processing libraries (optional, load dynamically)
 let mammoth = null;
@@ -570,6 +575,45 @@ app.get('/fetch-js', async (req, res) => {
 
     const page = await browser.newPage();
 
+    // Capturar llamadas API/JSON que hace la página
+    const apiCalls = [];
+    await page.setRequestInterception(true);
+
+    page.on('request', request => {
+      request.continue();
+    });
+
+    page.on('response', async response => {
+      try {
+        const contentType = response.headers()['content-type'] || '';
+        const reqUrl = response.url();
+
+        // Capturar respuestas JSON de APIs (no scripts de librerías)
+        if (contentType.includes('application/json') &&
+            !reqUrl.includes('googleapis.com') &&
+            !reqUrl.includes('google.com/maps') &&
+            !reqUrl.includes('gstatic.com') &&
+            !reqUrl.includes('facebook') &&
+            !reqUrl.includes('analytics')) {
+
+          const responseData = await response.json().catch(() => null);
+          if (responseData) {
+            apiCalls.push({
+              url: reqUrl,
+              method: response.request().method(),
+              status: response.status(),
+              dataPreview: JSON.stringify(responseData).substring(0, 500),
+              isArray: Array.isArray(responseData),
+              itemCount: Array.isArray(responseData) ? responseData.length : null
+            });
+            console.log(`[FetchJS] API call captured: ${reqUrl}`);
+          }
+        }
+      } catch (e) {
+        // Ignorar errores de parsing
+      }
+    });
+
     // Configurar user agent
     await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36');
 
@@ -705,7 +749,7 @@ app.get('/fetch-js', async (req, res) => {
       }
     });
 
-    console.log(`[FetchJS] Extraído: ${textContent.length} textos, ${tables.length} tablas, ${downloadLinks.length} archivos`);
+    console.log(`[FetchJS] Extraído: ${textContent.length} textos, ${tables.length} tablas, ${downloadLinks.length} archivos, ${apiCalls.length} API calls`);
 
     res.json({
       type: 'html',
@@ -715,6 +759,7 @@ app.get('/fetch-js', async (req, res) => {
       tables: tables.slice(0, 10),
       downloadLinks: downloadLinks.slice(0, 20),
       embeddedData: embeddedData.found ? embeddedData : undefined, // Datos JSON extraídos de scripts
+      apiCalls: apiCalls.length > 0 ? apiCalls : undefined, // Llamadas API JSON capturadas durante la carga
       fetchedAt: new Date().toISOString(),
       renderedWith: 'puppeteer'
     });
